@@ -336,6 +336,25 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /mutate-kueue-x-k8s-io-v1alpha1-testjob
+  failurePolicy: Fail
+  name: mtestjob.kb.io
+  rules:
+  - apiGroups:
+    - kueue.x-k8s.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    resources:
+    - testjobs
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /mutate-kubeflow-org-v1-tfjob
   failurePolicy: Fail
   name: mtfjob.kb.io
@@ -771,6 +790,26 @@ webhooks:
     - UPDATE
     resources:
     - statefulsets
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-kueue-x-k8s-io-v1alpha1-testjob
+  failurePolicy: Fail
+  name: vtestjob.kb.io
+  rules:
+  - apiGroups:
+    - kueue.x-k8s.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - testjobs
   sideEffects: None
 - admissionReviewVersions:
   - v1

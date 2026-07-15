@@ -21,10 +21,15 @@ package fake
 import (
 	rest "k8s.io/client-go/rest"
 	testing "k8s.io/client-go/testing"
+	v1alpha1 "sigs.k8s.io/kueue/client-go/clientset/versioned/typed/kueue/v1alpha1"
 )
 
 type FakeKueueV1alpha1 struct {
 	*testing.Fake
+}
+
+func (c *FakeKueueV1alpha1) TestJobs(namespace string) v1alpha1.TestJobInterface {
+	return newFakeTestJobs(c, namespace)
 }
 
 // RESTClient returns a RESTClient that is used to communicate

@@ -31,5 +31,6 @@ import (
 	_ "sigs.k8s.io/kueue/pkg/controller/jobs/rayservice"
 	_ "sigs.k8s.io/kueue/pkg/controller/jobs/sparkapplication"
 	_ "sigs.k8s.io/kueue/pkg/controller/jobs/statefulset"
+	_ "sigs.k8s.io/kueue/pkg/controller/jobs/testjob"
 	_ "sigs.k8s.io/kueue/pkg/controller/jobs/trainjob"
 )

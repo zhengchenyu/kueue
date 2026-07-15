@@ -45,6 +45,7 @@ clientConnection:
 integrations:
   frameworks:
   - "batch/job"
+  - "kueue.x-k8s.io/testjob"
   - "kubeflow.org/mpijob"
   - "ray.io/rayjob"
   - "ray.io/raycluster"

@@ -19,6 +19,7 @@ rules:
   resources:
   - pods
   verbs:
+  - create
   - delete
   - get
   - list
@@ -251,6 +252,8 @@ rules:
   - cohorts/status
   - localqueues/status
   - multikueueclusters/status
+  - testjobs/finalizers
+  - testjobs/status
   - workloads/status
   verbs:
   - get
@@ -275,6 +278,17 @@ rules:
   - delete
   - get
   - list
+  - update
+  - watch
+- apiGroups:
+  - kueue.x-k8s.io
+  resources:
+  - testjobs
+  verbs:
+  - delete
+  - get
+  - list
+  - patch
   - update
   - watch
 - apiGroups:
