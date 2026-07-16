@@ -32,7 +32,8 @@ type TestJobSpecApplyConfiguration struct {
 	// parallelism is the maximum desired number of active pods.
 	Parallelism *int32 `json:"parallelism,omitempty"`
 	// completions is the desired number of successfully finished pods.
-	// If unset, the TestJob keeps parallelism pods active.
+	// If unset or set to -1, the TestJob keeps parallelism pods active without
+	// completion semantics.
 	Completions *int32 `json:"completions,omitempty"`
 	// template describes the pods that will be created by this TestJob.
 	Template *v1.PodTemplateSpecApplyConfiguration `json:"template,omitempty"`

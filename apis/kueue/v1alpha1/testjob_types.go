@@ -35,8 +35,9 @@ type TestJobSpec struct {
 	Parallelism *int32 `json:"parallelism,omitempty"`
 
 	// completions is the desired number of successfully finished pods.
-	// If unset, the TestJob keeps parallelism pods active.
-	// +kubebuilder:validation:Minimum=0
+	// If unset or set to -1, the TestJob keeps parallelism pods active without
+	// completion semantics.
+	// +kubebuilder:validation:Minimum=-1
 	// +optional
 	Completions *int32 `json:"completions,omitempty"`
 

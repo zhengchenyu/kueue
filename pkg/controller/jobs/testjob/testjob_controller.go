@@ -62,6 +62,8 @@ const (
 	TestJobUIDLabel  = "kueue.x-k8s.io/testjob-uid"
 
 	TestJobMinParallelismAnnotation = "kueue.x-k8s.io/job-min-parallelism"
+
+	noCompletions int32 = -1
 )
 
 func init() {
@@ -182,15 +184,22 @@ func (j *TestJob) Finished(ctx context.Context) (message string, success, finish
 }
 
 func (j *TestJob) PodsReady(ctx context.Context, _ client.Client) bool {
-	return j.Status.Succeeded+ptr.Deref(j.Status.Ready, int32(0)) >= j.podsCount()
+	if j.hasCompletionTarget() {
+		// comp = 100, par = 10, succeed = 10, ready = 10
+		return j.Status.Succeeded+ptr.Deref(j.Status.Ready, int32(0)) >= j.podsCount()
+	}
+	return ptr.Deref(j.Status.Ready, int32(0)) >= j.podsCount()
 }
 
 func (j *TestJob) ReclaimablePods(ctx context.Context, _ client.Client) ([]kueue.ReclaimablePod, error) {
+	if !j.hasCompletionTarget() {
+		return nil, nil
+	}
 	parallelism := ptr.Deref(j.Spec.Parallelism, int32(1))
 	if parallelism == 1 || j.Status.Succeeded == 0 {
 		return nil, nil
 	}
-	remaining := ptr.Deref(j.Spec.Completions, parallelism) - j.Status.Succeeded
+	remaining := *j.Spec.Completions - j.Status.Succeeded
 	if remaining >= parallelism {
 		return nil, nil
 	}
@@ -237,10 +246,14 @@ func (j *TestJob) validatePartialAdmission() field.ErrorList {
 
 func (j *TestJob) podsCount() int32 {
 	podsCount := ptr.Deref(j.Spec.Parallelism, int32(1))
-	if j.Spec.Completions != nil && *j.Spec.Completions < podsCount {
+	if j.hasCompletionTarget() && *j.Spec.Completions < podsCount {
 		podsCount = *j.Spec.Completions
 	}
 	return podsCount
+}
+
+func (j *TestJob) hasCompletionTarget() bool {
+	return j.Spec.Completions != nil && *j.Spec.Completions != noCompletions
 }
 
 func (j *TestJob) minPodsCount() *int32 {
@@ -392,8 +405,8 @@ func (w *TestJobWebhook) validateCommon(job *TestJob) field.ErrorList {
 	if ptr.Deref(job.Spec.Parallelism, int32(1)) < 0 {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "parallelism"), job.Spec.Parallelism, "must be greater than or equal to 0"))
 	}
-	if job.Spec.Completions != nil && *job.Spec.Completions < 0 {
-		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "completions"), job.Spec.Completions, "must be greater than or equal to 0"))
+	if job.Spec.Completions != nil && *job.Spec.Completions < noCompletions {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "completions"), job.Spec.Completions, "must be greater than or equal to -1"))
 	}
 	for i, container := range job.Spec.Template.Spec.Containers {
 		for resourceName, request := range container.Resources.Requests {

@@ -44,9 +44,10 @@ spec:
               completions:
                 description: |-
                   completions is the desired number of successfully finished pods.
-                  If unset, the TestJob keeps parallelism pods active.
+                  If unset or set to -1, the TestJob keeps parallelism pods active without
+                  completion semantics.
                 format: int32
-                minimum: 0
+                minimum: -1
                 type: integer
               parallelism:
                 default: 1

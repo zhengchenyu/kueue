@@ -148,6 +148,83 @@ func TestPodReconcilerCompletesFromObservedPods(t *testing.T) {
 	}
 }
 
+func TestPodReconcilerCompletionsZeroCompletesWithoutPods(t *testing.T) {
+	ctx := context.Background()
+	completions := int32(0)
+	job := makeTestJob("job", false, 3, &completions)
+
+	kClient := utiltesting.NewClientBuilder(kueuealpha.AddToScheme).
+		WithObjects(job).
+		WithStatusSubresource(job).
+		Build()
+	reconciler := &PodReconciler{client: kClient}
+
+	if _, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(job)}); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	pods := listTestPods(t, ctx, kClient, job)
+	if len(pods) != 0 {
+		t.Fatalf("pods count = %d, want 0", len(pods))
+	}
+	var gotJob kueuealpha.TestJob
+	if err := kClient.Get(ctx, client.ObjectKeyFromObject(job), &gotJob); err != nil {
+		t.Fatalf("Get(TestJob) error = %v", err)
+	}
+	if gotJob.Status.Active != 0 || gotJob.Status.Succeeded != 0 {
+		t.Fatalf("status = %+v, want active=0 succeeded=0", gotJob.Status)
+	}
+	if !hasJobCompleteCondition(gotJob.Status.Conditions) {
+		t.Fatalf("missing JobComplete condition: %+v", gotJob.Status.Conditions)
+	}
+}
+
+func TestPodReconcilerNoCompletionsSentinelKeepsParallelismPodsActive(t *testing.T) {
+	ctx := context.Background()
+	completions := int32(-1)
+	job := makeTestJob("job", false, 2, &completions)
+	succeededPod := makeTestPod(job, "job-0", corev1.PodSucceeded)
+
+	kClient := utiltesting.NewClientBuilder(kueuealpha.AddToScheme).
+		WithObjects(job, succeededPod).
+		WithStatusSubresource(job).
+		Build()
+	reconciler := &PodReconciler{client: kClient}
+
+	if _, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(job)}); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	pods := listTestPods(t, ctx, kClient, job)
+	if len(pods) != 3 {
+		t.Fatalf("pods count = %d, want 1 succeeded pod plus 2 active pods", len(pods))
+	}
+	var gotJob kueuealpha.TestJob
+	if err := kClient.Get(ctx, client.ObjectKeyFromObject(job), &gotJob); err != nil {
+		t.Fatalf("Get(TestJob) error = %v", err)
+	}
+	if gotJob.Status.Succeeded != 1 || gotJob.Status.Active != 2 {
+		t.Fatalf("status = %+v, want succeeded=1 active=2", gotJob.Status)
+	}
+	if hasJobCompleteCondition(gotJob.Status.Conditions) {
+		t.Fatalf("unexpected JobComplete condition: %+v", gotJob.Status.Conditions)
+	}
+}
+
+func TestReclaimablePodsSkippedWithoutCompletionTarget(t *testing.T) {
+	completions := int32(-1)
+	job := (*TestJob)(makeTestJob("job", false, 3, &completions))
+	job.Status.Succeeded = 1
+
+	reclaimable, err := job.ReclaimablePods(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ReclaimablePods() error = %v", err)
+	}
+	if len(reclaimable) != 0 {
+		t.Fatalf("ReclaimablePods() = %+v, want none", reclaimable)
+	}
+}
+
 func TestRunWithPodSetsInfoUpdatesParallelismForPartialAdmission(t *testing.T) {
 	job := (*TestJob)(makeTestJob("job", true, 10, nil))
 	job.Annotations = map[string]string{TestJobMinParallelismAnnotation: "2"}

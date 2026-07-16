@@ -223,7 +223,7 @@ func desiredActivePods(job *kueuealpha.TestJob, succeeded int32) int32 {
 	if parallelism < 0 {
 		return 0
 	}
-	if job.Spec.Completions == nil {
+	if !hasCompletionTarget(job) {
 		return parallelism
 	}
 	remaining := *job.Spec.Completions - succeeded
@@ -265,7 +265,7 @@ func calculateStatus(job *kueuealpha.TestJob, pods []corev1.Pod) kueuealpha.Test
 		now := metav1.Now()
 		status.StartTime = &now
 	}
-	if job.Spec.Completions != nil && status.Succeeded >= *job.Spec.Completions {
+	if hasCompletionTarget(job) && status.Succeeded >= *job.Spec.Completions {
 		now := metav1.Now()
 		if status.CompletionTime == nil {
 			status.CompletionTime = &now
@@ -279,10 +279,14 @@ func calculateStatus(job *kueuealpha.TestJob, pods []corev1.Pod) kueuealpha.Test
 }
 
 func testJobComplete(job *kueuealpha.TestJob) bool {
-	if job.Spec.Completions == nil {
+	if !hasCompletionTarget(job) {
 		return false
 	}
 	return job.Status.Succeeded >= *job.Spec.Completions
+}
+
+func hasCompletionTarget(job *kueuealpha.TestJob) bool {
+	return job.Spec.Completions != nil && *job.Spec.Completions != noCompletions
 }
 
 func podReady(pod *corev1.Pod) bool {
