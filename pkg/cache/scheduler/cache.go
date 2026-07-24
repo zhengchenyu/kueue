@@ -131,9 +131,9 @@ type Cache struct {
 	podsReadyCond sync.Cond
 
 	client                 client.Client
-	resourceFlavors        map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor
+	resourceFlavors        map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor		// string -> ResourceFlavor
 	podsReadyTracking      bool
-	admissionChecks        map[kueue.AdmissionCheckReference]AdmissionCheck
+	admissionChecks        map[kueue.AdmissionCheckReference]AdmissionCheck			// string -> AdmissionCheck
 	workloadInfoOptions    []workload.InfoOption
 	fairSharingEnabled     bool
 	admissionFairSharing   *config.AdmissionFairSharing

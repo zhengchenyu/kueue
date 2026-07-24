@@ -101,7 +101,7 @@ func logStickyWorkloadSelectionIfVerbose(log logr.Logger, wl *kueue.Workload) {
 type ClusterQueue struct {
 	hierarchy.ClusterQueue[*cohort]
 	name              kueue.ClusterQueueReference
-	heap              heap.Heap[workload.Info, workload.Reference]
+	heap              heap.Heap[workload.Info, workload.Reference]			// real workload queue
 	namespaceSelector labels.Selector
 	active            bool
 

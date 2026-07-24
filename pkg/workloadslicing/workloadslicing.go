@@ -162,7 +162,7 @@ func EnsureWorkloadSlices(
 	ctx context.Context,
 	clnt client.Client,
 	clk clock.Clock,
-	jobPodSets []kueue.PodSet,
+	jobPodSets []kueue.PodSet,			// 目标podsets, 来自于Job转化的Podset。原始podset是workload的Spec.PodSets.
 	jobObject client.Object,
 	jobObjectGVK schema.GroupVersionKind,
 ) (*kueue.Workload, bool, error) {

@@ -152,8 +152,8 @@ type Manager struct {
 	statusChecker StatusChecker
 	localQueues   map[queue.LocalQueueReference]*LocalQueue
 	// Tracks Workload's LocalQueue assignment throughout its whole lifetime (including running and finished).
-	workloadAssignedQueues map[workload.Reference]queue.LocalQueueReference
-	finishedWorkloads      map[workload.Reference]queue.LocalQueueReference
+	workloadAssignedQueues map[workload.Reference]queue.LocalQueueReference			// workload -> localQueue
+	finishedWorkloads      map[workload.Reference]queue.LocalQueueReference		  // finishedWorkloads -> localQueue
 
 	workloadOrdering workload.Ordering
 

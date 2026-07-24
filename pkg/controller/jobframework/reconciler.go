@@ -473,7 +473,7 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
 	}
 
 	// 3. handle workload is nil.
-	if wl == nil {
+	if wl == nil { // 对于 elastic workload, 如果是scale up, wl是nil，进而继续创建slices
 		log.V(3).Info("The workload is nil, handle job with no workload")
 		err := r.handleJobWithNoWorkload(ctx, job, object)
 		if err != nil {
@@ -933,7 +933,7 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
 	}
 
 	// If workload slicing is enabled for this job, use the slice-based processing path.
-	if WorkloadSliceEnabled(job) {
+	if WorkloadSliceEnabled(job) { // elastic workload
 		podSets, err := JobPodSets(ctx, job, r.client)
 		if err != nil {
 			return nil, fmt.Errorf("failed to retrieve pod sets from job: %w", err)
@@ -1465,7 +1465,7 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
 	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue)
 
 	// Lookup existing slice for a given job.
-	workloadSlices, err := workloadslicing.FindNotFinishedWorkloads(ctx, clnt, job.Object(), job.GVK())
+	workloadSlices, err := workloadslicing.FindNotFinishedWorkloads(ctx, clnt, job.Object(), job.GVK()) // job -> not workload slice
 	if err != nil {
 		return fmt.Errorf("failure looking up workload slices: %w", err)
 	}
@@ -1477,7 +1477,7 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
 		return nil
 	case 1:
 		// Scale-up event - link to old slice and carry origin name.
-		oldSlice := workloadSlices[0]
+		oldSlice := workloadSlices[0]			// 如果只有一个，就创建一个新workload slice。由于返回的workloadSlices是按照时间排序的，所以workloadSlices[0]就是old slice
 		metav1.SetMetaDataAnnotation(&wl.ObjectMeta, workloadslicing.WorkloadSliceReplacementFor, string(workload.Key(&oldSlice)))
 		originName := oldSlice.Annotations[kueue.WorkloadSliceNameAnnotation]
 		if originName == "" {
