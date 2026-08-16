@@ -35,6 +35,7 @@ import (
 	config "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
+	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
 	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
@@ -1552,7 +1553,7 @@ func TestFairPreemptions(t *testing.T) {
 			recorder := &utiltesting.EventRecorder{}
 			preemptor := New(cl, workload.Ordering{}, recorder, &config.FairSharing{
 				PreemptionStrategies: tc.strategies,
-			}, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
+			}, false, 0, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
 
 			beforeSnapshot, err := cqCache.Snapshot(ctx)
 			if err != nil {
@@ -1698,7 +1699,7 @@ func TestFairPreemptionSkipsUnsatisfiableTournament(t *testing.T) {
 			}
 
 			preemptor := New(cl, workload.Ordering{}, &utiltesting.EventRecorder{}, &config.FairSharing{},
-				false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
+				false, 0, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
 			wlInfo := workload.NewInfo(setupLog, unitWl.Clone().Name("a_incoming").Obj())
 			wlInfo.ClusterQueue = "a"
 			strategies := preemptor.GetPreemptionStrategyIterator(ctx, *wlInfo, snapshot, singlePodSetAssignment(
@@ -1728,5 +1729,249 @@ func TestFairPreemptionSkipsUnsatisfiableTournament(t *testing.T) {
 					skippedQueues, tc.wantSkippedQueues)
 			}
 		})
+	}
+}
+
+func TestFairPreemptionsPartial(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
+	now := time.Now()
+	flavors := []*kueue.ResourceFlavor{
+		utiltestingapi.MakeResourceFlavor("default").Obj(),
+	}
+	// Cohort "all" with two CQs (nominal 3 each). The victim in "b" borrows up to 5; an incoming
+	// workload to "a" reclaims via fair sharing.
+	clusterQueues := []*kueue.ClusterQueue{
+		utiltestingapi.MakeClusterQueue("a").
+			Cohort("all").
+			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").
+				Resource(corev1.ResourceCPU, "3").Obj()).
+			Preemption(kueue.ClusterQueuePreemption{
+				WithinClusterQueue:  kueue.PreemptionPolicyLowerPriority,
+				ReclaimWithinCohort: kueue.PreemptionPolicyAny,
+			}).
+			Obj(),
+		utiltestingapi.MakeClusterQueue("b").
+			Cohort("all").
+			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").
+				Resource(corev1.ResourceCPU, "3").Obj()).
+			Preemption(kueue.ClusterQueuePreemption{
+				WithinClusterQueue:  kueue.PreemptionPolicyLowerPriority,
+				ReclaimWithinCohort: kueue.PreemptionPolicyAny,
+			}).
+			Obj(),
+	}
+	// Victim: opt-in elastic job in "b", executor PodSet admitted at count=5 (5 CPU), minCount=1.
+	victim := utiltestingapi.MakeWorkload("victim", "").
+		UID("victim").
+		Annotation(constants.PartialPreemptionAnnotation, "true").
+		PodSets(*utiltestingapi.MakePodSet("executor", 5).
+			Request(corev1.ResourceCPU, "1").
+			SetMinimumCount(1).
+			Obj()).
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("b").
+				PodSets(utiltestingapi.MakePodSetAssignment("executor").
+					Assignment(corev1.ResourceCPU, "default", "5000m").
+					Count(5).
+					Obj()).
+				Obj(),
+			now,
+		).
+		Obj()
+	incoming := utiltestingapi.MakeWorkload("in", "").
+		UID("wl-in").
+		Request(corev1.ResourceCPU, "4").
+		Obj()
+
+	ctx, log := utiltesting.ContextWithLog(t)
+	cl := utiltesting.NewClientBuilder().
+		WithLists(&kueue.WorkloadList{Items: []kueue.Workload{*victim}}).
+		WithStatusSubresource(&kueue.Workload{}).
+		Build()
+	cqCache := schdcache.New(cl)
+	for _, flv := range flavors {
+		cqCache.AddOrUpdateResourceFlavor(log, flv)
+	}
+	for _, cq := range clusterQueues {
+		if err := cqCache.AddClusterQueue(ctx, cq); err != nil {
+			t.Fatalf("Couldn't add ClusterQueue to cache: %v", err)
+		}
+	}
+	recorder := &utiltesting.EventRecorder{}
+	preemptor := New(cl, workload.Ordering{}, recorder, &config.FairSharing{}, false, 0, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
+
+	beforeSnapshot, err := cqCache.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error while building snapshot: %v", err)
+	}
+	snapshot, err := cqCache.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error while building snapshot: %v", err)
+	}
+	wlInfo := workload.NewInfo(log, incoming)
+	wlInfo.ClusterQueue = "a"
+	strategies := preemptor.GetPreemptionStrategyIterator(ctx, *wlInfo, snapshot, singlePodSetAssignment(
+		flavorassigner.ResourceAssignment{
+			corev1.ResourceCPU: &flavorassigner.FlavorAssignment{
+				Name: "default", Mode: flavorassigner.Preempt,
+			},
+		},
+	))
+	targets := preemptor.GetTargetsWithStrategy(ctx, strategies)
+
+	if len(targets) != 1 {
+		t.Fatalf("got %d targets, want 1", len(targets))
+	}
+	target := targets[0]
+	if target.WorkloadInfo.Obj.Name != "victim" {
+		t.Errorf("preempted workload = %q, want %q", target.WorkloadInfo.Obj.Name, "victim")
+	}
+	if target.PartialPreemption == nil {
+		t.Fatalf("target.PartialPreemption = nil, want a partial-preemption request (fair path)")
+	}
+	if got, want := target.PartialPreemption.PodSet, kueue.PodSetReference("executor"); got != want {
+		t.Errorf("PartialPreemption.PodSet = %q, want %q", got, want)
+	}
+	if got, want := target.PartialPreemption.ReclaimTargetCount, int32(2); got != want {
+		t.Errorf("PartialPreemption.ReclaimTargetCount = %d, want %d", got, want)
+	}
+	if diff := cmp.Diff(beforeSnapshot, snapshot, snapCmpOpts); diff != "" {
+		t.Errorf("Snapshot was modified (-initial,+end):\n%s", diff)
+	}
+
+	noFitIncoming := utiltestingapi.MakeWorkload("no-fit", "").
+		UID("wl-no-fit").
+		Request(corev1.ResourceCPU, "7").
+		Obj()
+	noFitSnapshot, err := cqCache.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error while building no-fit snapshot: %v", err)
+	}
+	noFitInfo := workload.NewInfo(log, noFitIncoming)
+	noFitInfo.ClusterQueue = "a"
+	noFitStrategies := preemptor.GetPreemptionStrategyIterator(ctx, *noFitInfo, noFitSnapshot, singlePodSetAssignment(
+		flavorassigner.ResourceAssignment{
+			corev1.ResourceCPU: &flavorassigner.FlavorAssignment{
+				Name: "default", Mode: flavorassigner.Preempt,
+			},
+		},
+	))
+	noFitTargets := preemptor.GetTargetsWithStrategy(ctx, noFitStrategies)
+	if len(noFitTargets) != 0 {
+		t.Fatalf("got targets %+v, want none when the preemptor cannot fit", noFitTargets)
+	}
+	if diff := cmp.Diff(beforeSnapshot, noFitSnapshot, snapCmpOpts); diff != "" {
+		t.Errorf("No-fit snapshot was modified (-initial,+end):\n%s", diff)
+	}
+}
+
+func TestFairPartialPreemptionAllowedWhenOnlyReclaimedSliceIsRemoved(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
+	now := time.Now()
+	flavors := []*kueue.ResourceFlavor{
+		utiltestingapi.MakeResourceFlavor("default").Obj(),
+	}
+	clusterQueues := []*kueue.ClusterQueue{
+		utiltestingapi.MakeClusterQueue("a").
+			Cohort("all").
+			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").
+				Resource(corev1.ResourceCPU, "3").Obj()).
+			Preemption(kueue.ClusterQueuePreemption{
+				WithinClusterQueue:  kueue.PreemptionPolicyLowerPriority,
+				ReclaimWithinCohort: kueue.PreemptionPolicyAny,
+			}).
+			Obj(),
+		utiltestingapi.MakeClusterQueue("b").
+			Cohort("all").
+			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").
+				Resource(corev1.ResourceCPU, "3").Obj()).
+			Preemption(kueue.ClusterQueuePreemption{
+				WithinClusterQueue:  kueue.PreemptionPolicyLowerPriority,
+				ReclaimWithinCohort: kueue.PreemptionPolicyAny,
+			}).
+			Obj(),
+		utiltestingapi.MakeClusterQueue("c").
+			Cohort("all").
+			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").
+				Resource(corev1.ResourceCPU, "4").Obj()).
+			Obj(),
+	}
+	victim := utiltestingapi.MakeWorkload("victim", "").
+		UID("victim").
+		Annotation(constants.PartialPreemptionAnnotation, "true").
+		PodSets(*utiltestingapi.MakePodSet("executor", 7).
+			Request(corev1.ResourceCPU, "1").
+			SetMinimumCount(1).
+			Obj()).
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission("b").
+				PodSets(utiltestingapi.MakePodSetAssignment("executor").
+					Assignment(corev1.ResourceCPU, "default", "7000m").
+					Count(7).
+					Obj()).
+				Obj(),
+			now,
+		).
+		Obj()
+	incoming := utiltestingapi.MakeWorkload("in", "").
+		UID("wl-in").
+		Request(corev1.ResourceCPU, "4").
+		Obj()
+
+	ctx, log := utiltesting.ContextWithLog(t)
+	cl := utiltesting.NewClientBuilder().
+		WithLists(&kueue.WorkloadList{Items: []kueue.Workload{*victim}}).
+		WithStatusSubresource(&kueue.Workload{}).
+		Build()
+	cqCache := schdcache.New(cl)
+	for _, flv := range flavors {
+		cqCache.AddOrUpdateResourceFlavor(log, flv)
+	}
+	for _, cq := range clusterQueues {
+		if err := cqCache.AddClusterQueue(ctx, cq); err != nil {
+			t.Fatalf("Couldn't add ClusterQueue to cache: %v", err)
+		}
+	}
+	recorder := &utiltesting.EventRecorder{}
+	// Use only the LessThanOrEqualToFinalShare strategy so the preemptor can be
+	// admitted only through this fairness comparison.
+	preemptor := New(cl, workload.Ordering{}, recorder, &config.FairSharing{
+		PreemptionStrategies: []config.PreemptionStrategy{config.LessThanOrEqualToFinalShare},
+	}, false, 0, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil)
+
+	beforeSnapshot, err := cqCache.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error while building snapshot: %v", err)
+	}
+	snapshot, err := cqCache.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error while building snapshot: %v", err)
+	}
+	wlInfo := workload.NewInfo(log, incoming)
+	wlInfo.ClusterQueue = "a"
+	strategies := preemptor.GetPreemptionStrategyIterator(ctx, *wlInfo, snapshot, singlePodSetAssignment(
+		flavorassigner.ResourceAssignment{
+			corev1.ResourceCPU: &flavorassigner.FlavorAssignment{
+				Name: "default", Mode: flavorassigner.Preempt,
+			},
+		},
+	))
+	targets := preemptor.GetTargetsWithStrategy(ctx, strategies)
+
+	if len(targets) != 1 {
+		t.Fatalf("got %d targets, want 1 (partial preemption must be allowed using the reclaimed slice)", len(targets))
+	}
+	target := targets[0]
+	if target.WorkloadInfo.Obj.Name != "victim" {
+		t.Errorf("preempted workload = %q, want %q", target.WorkloadInfo.Obj.Name, "victim")
+	}
+	if target.PartialPreemption == nil {
+		t.Fatalf("target.PartialPreemption = nil, want a partial-preemption request")
+	}
+	if got, want := target.PartialPreemption.ReclaimTargetCount, int32(6); got != want {
+		t.Errorf("PartialPreemption.ReclaimTargetCount = %d, want %d", got, want)
+	}
+	if diff := cmp.Diff(beforeSnapshot, snapshot, snapCmpOpts); diff != "" {
+		t.Errorf("Snapshot was modified (-initial,+end):\n%s", diff)
 	}
 }

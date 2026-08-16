@@ -110,15 +110,19 @@ func iterateOverCandidates(
 	allowBorrowing bool,
 	yield func(*Target) bool,
 ) (cont bool) {
+	// planPreemption must be called before YieldFromSnapshot wraps yield, because
+	// searchPartialReduction (called inside planPreemption) needs the candidate still
+	// present in the snapshot for its binary search. YieldFromSnapshot removes the
+	// candidate from the snapshot before calling the inner yield.
+	fits := func() bool { return workloadQuotaFits(preemptionCtx, allowBorrowing) }
 	yield = policy.YieldFromSnapshot(preemptionCtx.snapshot, yield)
 	iterator.Reset()
 	for candidateWl, reason := iterator.Next(allowBorrowing); candidateWl != nil; candidateWl, reason = iterator.Next(allowBorrowing) {
-		candidate := &Target{
-			WorkloadInfo: candidateWl,
-			Reason:       reason,
-			WorkloadCq:   preemptionCtx.snapshot.ClusterQueue(candidateWl.ClusterQueue),
-		}
-		if !yield(candidate) {
+		plan := planPreemption(preemptionCtx, candidateWl, reason, fits)
+		// WorkloadCq must be read after planPreemption returns, since searchPartialReduction
+		// temporarily removes and restores the candidate during its search.
+		plan.target.WorkloadCq = preemptionCtx.snapshot.ClusterQueue(candidateWl.ClusterQueue)
+		if !yield(plan.target) {
 			return
 		}
 	}

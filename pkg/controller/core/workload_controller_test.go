@@ -43,6 +43,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/component-base/featuregate"
 	testingclock "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -3347,6 +3348,110 @@ func TestUpdateAfsConsumedUsage(t *testing.T) {
 			}
 			if gotEntry.StatusAccounted != tc.wantStatusAccounted {
 				t.Errorf("unexpected StatusAccounted: want %t, got %t", tc.wantStatusAccounted, gotEntry.StatusAccounted)
+			}
+		})
+	}
+}
+
+func TestReconcileResizeScaleDownClearsSatisfiedReclaimTargetCount(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
+	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
+	now := time.Now().Truncate(time.Second)
+
+	makeWorkload := func(specCount, admittedCount int32, targetCount *int32) *kueue.Workload {
+		wl := utiltestingapi.MakeWorkload("resize", "default").
+			Annotation(constants.ElasticJobAnnotation, "true").
+			PodSets(*utiltestingapi.MakePodSet("executor", int(specCount)).
+				Request(corev1.ResourceCPU, "1").
+				SetMinimumCount(1).
+				Obj()).
+			ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").
+				PodSets(utiltestingapi.MakePodSetAssignment("executor").
+					Assignment(corev1.ResourceCPU, "default", fmt.Sprintf("%d", admittedCount)).
+					Count(admittedCount).
+					Obj()).
+				Obj(), now).
+			Obj()
+		wl.Status.Admission.PodSetAssignments[0].ReclaimTargetCount = targetCount
+		return wl
+	}
+
+	cases := map[string]struct {
+		specCount     int32
+		admittedCount int32
+		targetCount   *int32
+		wantCount     int32
+		wantTarget    *int32
+		wantUpdated   bool
+	}{
+		"scale-down converges admission and clears target": {
+			specCount:     2,
+			admittedCount: 5,
+			targetCount:   ptr.To[int32](2),
+			wantCount:     2,
+			wantUpdated:   true,
+		},
+		"already converged target is repaired": {
+			specCount:     2,
+			admittedCount: 2,
+			targetCount:   ptr.To[int32](2),
+			wantCount:     2,
+			wantUpdated:   true,
+		},
+		"target remains until desired count reaches it": {
+			specCount:     3,
+			admittedCount: 5,
+			targetCount:   ptr.To[int32](2),
+			wantCount:     3,
+			wantTarget:    ptr.To[int32](2),
+			wantUpdated:   true,
+		},
+		"spec below target clears it": {
+			specCount:     1,
+			admittedCount: 1,
+			targetCount:   ptr.To[int32](2),
+			wantCount:     1,
+			wantUpdated:   true,
+		},
+		"nothing to update": {
+			specCount:     3,
+			admittedCount: 3,
+			wantCount:     3,
+			wantUpdated:   false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			wl := makeWorkload(tc.specCount, tc.admittedCount, tc.targetCount)
+			cl := utiltesting.NewClientBuilder().
+				WithObjects(wl).
+				WithStatusSubresource(&kueue.Workload{}).
+				WithInterceptorFuncs(interceptor.Funcs{SubResourceApply: utiltesting.TreatSSAAsStrategicMergeForApplyConfiguration}).
+				Build()
+			reconciler := &WorkloadReconciler{
+				client: cl,
+				clock:  testingclock.NewFakeClock(now),
+			}
+			ctx, _ := utiltesting.ContextWithLog(t)
+			updated, err := reconciler.reconcileResizeScaleDown(ctx, wl)
+			if err != nil {
+				t.Fatalf("reconcileResizeScaleDown() error = %v", err)
+			}
+			if updated != tc.wantUpdated {
+				t.Errorf("reconcileResizeScaleDown() updated = %v, want %v", updated, tc.wantUpdated)
+			}
+
+			got := &kueue.Workload{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(wl), got); err != nil {
+				t.Fatalf("getting workload: %v", err)
+			}
+			psa := got.Status.Admission.PodSetAssignments[0]
+			if count := ptr.Deref(psa.Count, -1); count != tc.wantCount {
+				t.Errorf("admitted count = %d, want %d", count, tc.wantCount)
+			}
+			if diff := cmp.Diff(tc.wantTarget, psa.ReclaimTargetCount); diff != "" {
+				t.Errorf("ReclaimTargetCount (-want,+got):\n%s", diff)
 			}
 		})
 	}

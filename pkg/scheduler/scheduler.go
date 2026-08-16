@@ -105,6 +105,7 @@ type options struct {
 	podsReadyRequeuingTimestamp config.RequeuingTimestamp
 	fairSharing                 *config.FairSharing
 	admissionFairSharing        *config.AdmissionFairSharing
+	partialPreemptionTimeout    time.Duration
 	quotaCheckStrategy          config.QuotaCheckStrategy
 	clock                       clock.Clock
 	roleTracker                 *roletracker.RoleTracker
@@ -136,6 +137,12 @@ func WithFairSharing(fs *config.FairSharing) Option {
 		if fs != nil {
 			o.fairSharing = fs
 		}
+	}
+}
+
+func WithPartialPreemptionTimeout(timeout time.Duration) Option {
+	return func(o *options) {
+		o.partialPreemptionTimeout = timeout
 	}
 }
 
@@ -215,6 +222,7 @@ func New(queues *qcache.Manager, cache *schdcache.Cache, cl client.Client, recor
 			recorder,
 			options.fairSharing,
 			afs.Enabled(options.admissionFairSharing),
+			options.partialPreemptionTimeout,
 			options.clock,
 			options.roleTracker,
 			options.preemptionExpectations,
@@ -932,7 +940,12 @@ func (s *Scheduler) updateAssignmentIfNeeded(
 func fits(snapshot *schdcache.Snapshot, cq *schdcache.ClusterQueueSnapshot, usage *workload.Usage, preemptedWorkloads preemption.PreemptedWorkloads,
 	newTargets []*preemption.Target) schdcache.FitsCheck {
 	merged := preemptedWorkloads.MergeWithTargets(newTargets)
-	revertUsage := snapshot.SimulateWorkloadUsageRemoval(merged.Workloads())
+	targets := merged.Workloads()
+	workloads := make([]*workload.Info, 0, len(targets))
+	for _, target := range targets {
+		workloads = append(workloads, target.WorkloadInfo)
+	}
+	revertUsage := snapshot.SimulateWorkloadUsageRemoval(workloads)
 	defer revertUsage()
 	return cq.Fits(*usage)
 }
@@ -993,9 +1006,15 @@ func (s *Scheduler) evictWorkloadAfterFailedTASReplacement(ctx context.Context, 
 // out of the snapshot and returns the single undo. Freeing their quota is not enough:
 // until the simulator is told, it still reports their Pods and their host ports.
 func simulateOtherPreemptions(ctx context.Context, log logr.Logger, snapshot *schdcache.Snapshot, preemptedWorkloads preemption.PreemptedWorkloads) func() {
-	victims := slices.Collect(maps.Values(preemptedWorkloads))
-	revertUsage := snapshot.SimulateWorkloadRemoval(victims)
-	revertPods := snapshot.SimulatePodRemoval(ctx, log, victims)
+	targets := slices.Collect(maps.Values(preemptedWorkloads))
+	replacements := make([]schdcache.WorkloadReplacement, 0, len(targets))
+	targetWorkloads := make([]*workload.Info, 0, len(targets))
+	for _, t := range targets {
+		replacements = append(replacements, schdcache.WorkloadReplacement{Full: t.WorkloadInfo, Reduced: t.ReducedInfo})
+		targetWorkloads = append(targetWorkloads, t.WorkloadInfo)
+	}
+	revertUsage := snapshot.SimulateWorkloadRemoval(replacements)
+	revertPods := snapshot.SimulatePodRemoval(ctx, log, targetWorkloads)
 	return func() {
 		revertPods()
 		revertUsage()

@@ -1,0 +1,50 @@
+# Partial Preemption Example for batch/Job
+#
+# Partial preemption lets an elastic batch Job scale down to its minimum
+# parallelism when a higher-priority workload needs some quota, instead of
+# being fully evicted. This avoids wasting already-completed work.
+#
+# Prerequisites:
+#   1. Enable the PartialPreemption feature gate on the kueue-controller-manager.
+#   2. Configure the ClusterQueue to allow preemption (e.g. reclaimWithinCohort).
+#
+# Annotations required on the Job:
+#   kueue.x-k8s.io/partial-preemption: "true"   -- opts in to partial preemption
+#   kueue.x-k8s.io/job-min-parallelism: "<n>"   -- minimum acceptable parallelism
+#
+# When a higher-priority workload arrives, the Kueue scheduler will set
+# ReclaimTargetCount on the Workload's PodSet assignment. The job controller
+# reads that value and patches spec.parallelism down to the requested count.
+# Once the Job has actually scaled down (pods terminate), the workload
+# controller clears ReclaimTargetCount, completing the handshake.
+#
+# In this example the Job normally runs with parallelism=8 but accepts
+# a scale-down to as few as 2 workers before Kueue will fully evict it.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sample-partial-preemption-job
+  namespace: default
+  annotations:
+    # Opt in to partial preemption.
+    kueue.x-k8s.io/partial-preemption: "true"
+    # Minimum parallelism this job can run with without losing progress.
+    kueue.x-k8s.io/job-min-parallelism: "2"
+    # Place the job into a Kueue LocalQueue.
+    kueue.x-k8s.io/queue-name: user-queue
+spec:
+  # Normal (maximum) parallelism.
+  parallelism: 8
+  completions: 8
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: worker
+          image: bash:5
+          command: ["bash", "-c", "echo working && sleep 30"]
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"

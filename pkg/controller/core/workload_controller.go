@@ -1500,6 +1500,26 @@ func (r *WorkloadReconciler) handleUpdate(ctx context.Context, e event.TypedUpda
 				r.queues.DeleteSecondPassWithoutLock(wlKey)
 			}
 		})
+
+		if !immediate {
+			log.V(3).Info("Workload to be requeued after backoff", "backoff", backoff, "requeueAt", e.ObjectNew.Status.RequeueState.RequeueAt.Time)
+			// Skip delayed requeue for DRA workloads — handled in the Reconcile loop.
+			if workload.HasDRA(e.ObjectNew) {
+				log.V(3).Info("Skipping delayed requeue for DRA workload - handled in Reconcile")
+			} else {
+				time.AfterFunc(backoff, func() {
+					updatedWl := kueue.Workload{}
+					err := r.client.Get(ctx, client.ObjectKeyFromObject(e.ObjectNew), &updatedWl)
+					if err == nil && workload.Status(&updatedWl) == workload.StatusPending {
+						if err = r.queues.AddOrUpdateWorkload(ctx, log, &updatedWl); err != nil {
+							log.V(2).Info("ignored an error for now", "error", err)
+						} else {
+							log.V(3).Info("Workload requeued after backoff")
+						}
+					}
+				})
+			}
+		}
 	case prevStatus == workload.StatusAdmitted && status == workload.StatusAdmitted && !equality.Semantic.DeepEqual(e.ObjectOld.Status.ReclaimablePods, e.ObjectNew.Status.ReclaimablePods),
 		features.Enabled(features.ElasticJobsViaWorkloadSlices) && workloadslicing.ScaledDown(workload.ExtractPodSetCountsFromWorkload(e.ObjectOld), workload.ExtractPodSetCountsFromWorkload(e.ObjectNew)),
 		workload.PriorityChanged(log, e.ObjectOld, e.ObjectNew):
@@ -1510,6 +1530,14 @@ func (r *WorkloadReconciler) handleUpdate(ctx context.Context, e event.TypedUpda
 			// the next scheduling cycle.
 			r.cache.AddOrUpdateWorkload(ctx, log, wl)
 		})
+		// When the workload slices model is active and the workload scaled down, clear any
+		// satisfied partial-preemption reclaim targets so future scale-ups are not capped.
+		if features.Enabled(features.ElasticJobsViaWorkloadSlices) &&
+			workloadslicing.ScaledDown(workload.ExtractPodSetCountsFromWorkload(e.ObjectOld), workload.ExtractPodSetCountsFromWorkload(e.ObjectNew)) {
+			if _, err := r.reconcileResizeScaleDown(ctx, wl); err != nil {
+				log.Error(err, "Failed to converge admission after workload slice scale-down")
+			}
+		}
 
 	default:
 		// Workload update in the cache is handled here; however, some fields are immutable
@@ -1552,6 +1580,47 @@ func (r *WorkloadReconciler) reconcileAfsPenaltiesOnUpdate(
 		(status == workload.StatusFinished && prevStatus != workload.StatusFinished) {
 		r.queues.AfsUsageLedger.SubPenalty(qutil.KeyFromWorkload(e.ObjectNew), wlRef)
 	}
+}
+
+// reconcileResizeScaleDown clears satisfied partial-preemption reclaim targets after a
+// workload-slices scale-down. In the workload-slices model the admitted counts are not
+// adjusted in-place (a new Workload slice is created instead), so this function only
+// needs to nil out ReclaimTargetCount entries whose scale-down target has been reached.
+// Clearing a satisfied target lets the runtime request future scale-ups without being
+// capped by a stale target.
+func (r *WorkloadReconciler) reconcileResizeScaleDown(ctx context.Context, wl *kueue.Workload) (bool, error) {
+	if !features.Enabled(features.PartialPreemption) {
+		return false, nil
+	}
+	updated := false
+	err := workloadpatching.PatchAdmissionStatus(ctx, r.client, wl, r.clock, func(wl *kueue.Workload) (bool, error) {
+		counts := workload.ExtractPodSetCountsFromWorkload(wl)
+		changed := false
+		for i := range wl.Status.Admission.PodSetAssignments {
+			psa := &wl.Status.Admission.PodSetAssignments[i]
+			sc, ok := counts[psa.Name]
+			if !ok {
+				continue
+			}
+			admittedCount := ptr.Deref(psa.Count, 0)
+			if admittedCount > sc {
+				// The spec count has been scaled down; converge the admitted count.
+				psa.Count = ptr.To(sc)
+				changed = true
+			}
+			if psa.ReclaimTargetCount != nil && sc <= *psa.ReclaimTargetCount {
+				// The spec count has reached (or passed) the reclaim target; clear it.
+				psa.ReclaimTargetCount = nil
+				changed = true
+			}
+		}
+		updated = changed
+		return changed, nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return updated, nil
 }
 
 // reachedAfsAnchor reports whether the Workload crossed the configured AFS

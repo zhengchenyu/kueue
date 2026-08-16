@@ -884,6 +884,21 @@ const (
 	// Verifies fair sharing preemption targets after fillBackWorkloads
 	// to prevent preemption loops caused by temporary share deflation.
 	FairSharingVerifyFinalTargets featuregate.Feature = "FairSharingVerifyFinalTargets"
+
+	// owner: @zhengchenyu
+	//
+	// PartialPreemption enables preempting only a subset of an elastic workload's PodSet
+	// (scaling it down towards its minCount) instead of evicting the whole workload, when the
+	// workload tolerates downscaling.
+	PartialPreemption featuregate.Feature = "PartialPreemption"
+
+	// owner: @zhengchenyu
+	//
+	// ElasticJobsViaWorkloadResize enables elastic job support via in-place workload resize
+	// (adjusting PodSet counts directly on the Workload) as an alternative to the
+	// workload-slices approach. When enabled, a workload can scale down by updating
+	// its spec PodSet count, and Kueue converges the admitted count accordingly.
+	ElasticJobsViaWorkloadResize featuregate.Feature = "ElasticJobsViaWorkloadResize"
 )
 
 func init() {
@@ -1120,6 +1135,12 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
 	},
 	CustomMetricLabels: {
 		{Version: version.MustParse("0.17"), Default: false, PreRelease: featuregate.Alpha},
+	},
+	PartialPreemption: {
+		{Version: version.MustParse("0.18"), Default: false, PreRelease: featuregate.Alpha},
+	},
+	ElasticJobsViaWorkloadResize: {
+		{Version: version.MustParse("0.18"), Default: false, PreRelease: featuregate.Alpha},
 	},
 	SparkApplicationIntegration: {
 		{Version: version.MustParse("0.17"), Default: false, PreRelease: featuregate.Alpha},

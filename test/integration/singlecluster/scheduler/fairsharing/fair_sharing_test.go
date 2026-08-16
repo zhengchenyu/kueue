@@ -27,19 +27,23 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/component-base/metrics/testutil"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	config "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/controller/core"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/metrics"
 	utilqueue "sigs.k8s.io/kueue/pkg/util/queue"
 	"sigs.k8s.io/kueue/pkg/util/roletracker"
+	testing "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 	"sigs.k8s.io/kueue/pkg/workload"
 	"sigs.k8s.io/kueue/test/integration/framework"
+	"sigs.k8s.io/kueue/test/util"
 	"sigs.k8s.io/kueue/test/util/behavioral"
 	"sigs.k8s.io/kueue/test/util/behavioral/integration"
 )
@@ -516,6 +520,172 @@ var _ = ginkgo.Describe("Scheduler", ginkgo.Label("feature:fairsharing"), func()
 				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pIncoming), &wl)).To(gomega.Succeed())
 				g.Expect(workload.IsAdmitted(&wl)).To(gomega.BeFalse(), "p-incoming should not be admitted")
 			}, behavioral.ConsistentDuration, behavioral.Interval).Should(gomega.Succeed())
+		})
+	})
+
+	ginkgo.When("Partial preemption is enabled", func() {
+		ginkgo.BeforeEach(func() {
+			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.ElasticJobsViaWorkloadSlices, false)
+			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.ElasticJobsViaWorkloadResize, true)
+			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.PartialPreemption, true)
+
+			createQueue(testing.MakeClusterQueue("a").
+				Cohort("all").
+				ResourceGroup(
+					*testing.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "3").Obj(),
+				).Preemption(kueue.ClusterQueuePreemption{
+				ReclaimWithinCohort: kueue.PreemptionPolicyAny,
+				WithinClusterQueue:  kueue.PreemptionPolicyLowerPriority,
+			}).Obj())
+
+			createQueue(testing.MakeClusterQueue("b").
+				Cohort("all").
+				ResourceGroup(
+					*testing.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "3").Obj(),
+				).Preemption(kueue.ClusterQueuePreemption{
+				ReclaimWithinCohort: kueue.PreemptionPolicyAny,
+				WithinClusterQueue:  kueue.PreemptionPolicyLowerPriority,
+			}).Obj())
+		})
+
+		ginkgo.It("should partially preempt across a cohort, clear reclaimTargetCount on scale-down, and re-admit on later scale-up", framework.SlowSpec, func() {
+			setResizeCount := func(wl *kueue.Workload, count int32) {
+				gomega.Eventually(func(g gomega.Gomega) {
+					updated := &kueue.Workload{}
+					g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), updated)).Should(gomega.Succeed())
+					updated.Spec.PodSets[0].Count = count
+					g.Expect(k8sClient.Update(ctx, updated)).Should(gomega.Succeed())
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			}
+			expectAdmittedCount := func(wl *kueue.Workload, want int32) {
+				gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
+					got := &kueue.Workload{}
+					g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), got)).Should(gomega.Succeed())
+					g.Expect(workload.IsAdmitted(got)).Should(gomega.BeTrue())
+					g.Expect(got.Status.Admission).ShouldNot(gomega.BeNil())
+					g.Expect(got.Status.Admission.PodSetAssignments).Should(gomega.HaveLen(1))
+					g.Expect(ptr.Deref(got.Status.Admission.PodSetAssignments[0].Count, -1)).Should(gomega.BeEquivalentTo(want))
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			}
+
+			ginkgo.By("Admitting an elastic victim in cq-b at count 5 that borrows quota from the cohort")
+			victim := testing.MakeWorkload("victim", ns.Name).
+				Annotation(constants.ElasticJobAnnotation, "true").
+				Annotation(constants.PartialPreemptionAnnotation, "true").
+				Priority(0).
+				Queue("b").
+				PodSets(*testing.MakePodSet("executor", 5).SetMinimumCount(1).Request(corev1.ResourceCPU, "1").Obj()).
+				Obj()
+			wls = append(wls, victim)
+			util.MustCreate(ctx, k8sClient, victim)
+			util.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, victim)
+			expectAdmittedCount(victim, 5)
+
+			ginkgo.By("Creating a higher priority preemptor in cq-a requesting 4 CPU")
+			preemptor := testing.MakeWorkload("preemptor", ns.Name).
+				Priority(10).
+				Queue("a").
+				PodSets(*testing.MakePodSet("main", 4).Request(corev1.ResourceCPU, "1").Obj()).
+				Obj()
+			wls = append(wls, preemptor)
+			util.MustCreate(ctx, k8sClient, preemptor)
+
+			ginkgo.By("Fair sharing requests a partial reclaim rather than a full eviction")
+			expectReclaimTargetCount(victim, ptr.To[int32](2))
+			expectPreemptedCondition(victim, metav1.ConditionTrue)
+
+			ginkgo.By("The victim keeps its reservation and the preemptor stays pending while the reclaim is pending")
+			gomega.Consistently(func(g gomega.Gomega) {
+				got := &kueue.Workload{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(victim), got)).Should(gomega.Succeed())
+				g.Expect(workload.IsEvicted(got)).Should(gomega.BeFalse())
+				g.Expect(ptr.Deref(got.Status.Admission.PodSetAssignments[0].Count, -1)).Should(gomega.BeEquivalentTo(int32(5)))
+			}, util.ConsistentDuration, util.Interval).Should(gomega.Succeed())
+			util.ExpectWorkloadsToBePending(ctx, k8sClient, preemptor)
+
+			ginkgo.By("Scaling the victim down to the reclaim target clears reclaimTargetCount and admits the preemptor")
+			setResizeCount(victim, 2)
+			expectAdmittedCount(victim, 2)
+			expectReclaimTargetCount(victim, nil)
+			util.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, preemptor)
+
+			ginkgo.By("Deleting the preemptor frees the reclaimed quota")
+			util.ExpectObjectToBeDeleted(ctx, k8sClient, preemptor, true)
+
+			ginkgo.By("Scaling the victim back up succeeds because the stale target was cleared")
+			setResizeCount(victim, 6)
+			expectAdmittedCount(victim, 6)
+			expectReclaimTargetCount(victim, nil)
+		})
+
+		ginkgo.It("should partially preempt a lower-priority workload within the same ClusterQueue under fair sharing", framework.SlowSpec, func() {
+			setResizeCount := func(wl *kueue.Workload, count int32) {
+				gomega.Eventually(func(g gomega.Gomega) {
+					updated := &kueue.Workload{}
+					g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), updated)).Should(gomega.Succeed())
+					updated.Spec.PodSets[0].Count = count
+					g.Expect(k8sClient.Update(ctx, updated)).Should(gomega.Succeed())
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			}
+			expectAdmittedCount := func(wl *kueue.Workload, want int32) {
+				gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
+					got := &kueue.Workload{}
+					g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), got)).Should(gomega.Succeed())
+					g.Expect(workload.IsAdmitted(got)).Should(gomega.BeTrue())
+					g.Expect(got.Status.Admission).ShouldNot(gomega.BeNil())
+					g.Expect(got.Status.Admission.PodSetAssignments).Should(gomega.HaveLen(1))
+					g.Expect(ptr.Deref(got.Status.Admission.PodSetAssignments[0].Count, -1)).Should(gomega.BeEquivalentTo(want))
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			}
+
+			ginkgo.By("Filling cq-b to its nominal quota so cq-a cannot borrow from the cohort")
+			filler := testing.MakeWorkload("filler", ns.Name).
+				Priority(10).
+				Queue("b").
+				PodSets(*testing.MakePodSet("main", 3).Request(corev1.ResourceCPU, "1").Obj()).
+				Obj()
+			wls = append(wls, filler)
+			util.MustCreate(ctx, k8sClient, filler)
+			util.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, filler)
+
+			ginkgo.By("Admitting an elastic victim in cq-a that uses cq-a's whole nominal quota")
+			victim := testing.MakeWorkload("in-cq-victim", ns.Name).
+				Annotation(constants.ElasticJobAnnotation, "true").
+				Annotation(constants.PartialPreemptionAnnotation, "true").
+				Priority(0).
+				Queue("a").
+				PodSets(*testing.MakePodSet("executor", 3).SetMinimumCount(1).Request(corev1.ResourceCPU, "1").Obj()).
+				Obj()
+			wls = append(wls, victim)
+			util.MustCreate(ctx, k8sClient, victim)
+			util.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, victim)
+			expectAdmittedCount(victim, 3)
+
+			ginkgo.By("Creating a higher-priority preemptor in the same ClusterQueue requesting 2 CPU")
+			preemptor := testing.MakeWorkload("in-cq-preemptor", ns.Name).
+				Priority(10).
+				Queue("a").
+				PodSets(*testing.MakePodSet("main", 2).Request(corev1.ResourceCPU, "1").Obj()).
+				Obj()
+			wls = append(wls, preemptor)
+			util.MustCreate(ctx, k8sClient, preemptor)
+
+			ginkgo.By("The victim is asked to partially reclaim rather than being fully evicted")
+			expectReclaimTargetCount(victim, ptr.To[int32](1))
+			expectPreemptedCondition(victim, metav1.ConditionTrue)
+			gomega.Consistently(func(g gomega.Gomega) {
+				got := &kueue.Workload{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(victim), got)).Should(gomega.Succeed())
+				g.Expect(workload.IsEvicted(got)).Should(gomega.BeFalse())
+				g.Expect(ptr.Deref(got.Status.Admission.PodSetAssignments[0].Count, -1)).Should(gomega.BeEquivalentTo(int32(3)))
+			}, util.ConsistentDuration, util.Interval).Should(gomega.Succeed())
+			util.ExpectWorkloadsToBePending(ctx, k8sClient, preemptor)
+
+			ginkgo.By("Scaling the victim down to the reclaim target clears reclaimTargetCount and admits the preemptor")
+			setResizeCount(victim, 1)
+			expectAdmittedCount(victim, 1)
+			expectReclaimTargetCount(victim, nil)
+			util.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, preemptor)
 		})
 	})
 
@@ -1887,6 +2057,27 @@ func expectCohortWeightedShare(cohortName string, weightedShare float64) {
 			g.Expect(v).Should(gomega.Equal(weightedShare))
 		}
 	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+}
+
+func expectReclaimTargetCount(wl *kueue.Workload, want *int32) {
+	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
+		got := &kueue.Workload{}
+		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), got)).Should(gomega.Succeed())
+		g.Expect(workload.IsAdmitted(got)).Should(gomega.BeTrue())
+		g.Expect(got.Status.Admission).ShouldNot(gomega.BeNil())
+		g.Expect(got.Status.Admission.PodSetAssignments).Should(gomega.HaveLen(1))
+		g.Expect(got.Status.Admission.PodSetAssignments[0].ReclaimTargetCount).Should(gomega.Equal(want))
+	}, util.Timeout, util.Interval).Should(gomega.Succeed())
+}
+
+func expectPreemptedCondition(wl *kueue.Workload, status metav1.ConditionStatus) {
+	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
+		got := &kueue.Workload{}
+		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), got)).Should(gomega.Succeed())
+		cond := meta.FindStatusCondition(got.Status.Conditions, kueue.WorkloadPreempted)
+		g.Expect(cond).ShouldNot(gomega.BeNil())
+		g.Expect(cond.Status).Should(gomega.Equal(status))
+	}, util.Timeout, util.Interval).Should(gomega.Succeed())
 }
 
 var _ = ginkgo.Describe("Scheduler", ginkgo.Label("feature:fairsharing", "feature:admissionfairsharing"), func() {

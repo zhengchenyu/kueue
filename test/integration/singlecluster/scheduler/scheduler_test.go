@@ -4954,4 +4954,61 @@ var _ = ginkgo.Describe("Scheduler with AdmissionGatedBy", ginkgo.Label("admissi
 		ginkgo.By("Verifying the workload is admitted after ungating")
 		behavioral.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, wl)
 	})
+
+	ginkgo.It("should partially preempt, clear reclaimTargetCount on scale-down, and re-admit on later scale-up", func() {
+		features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.PartialPreemption, true)
+
+		ginkgo.By("Admitting a partial-preemptable victim at count 6 and a blocker at count 4")
+		victim := testing.MakeWorkload("victim", ns.Name).
+			Annotation(constants.ElasticJobAnnotation, "true").
+			Annotation(constants.PartialPreemptionAnnotation, "true").
+			Priority(0).
+			Queue(kueue.LocalQueueName(lq.Name)).
+			PodSets(*testing.MakePodSet("main", 6).SetMinimumCount(2).Request(corev1.ResourceCPU, "1").Obj()).
+			Obj()
+		blocker := testing.MakeWorkload("blocker", ns.Name).
+			Priority(20).
+			Queue(kueue.LocalQueueName(lq.Name)).
+			PodSets(*testing.MakePodSet("main", 4).Request(corev1.ResourceCPU, "1").Obj()).
+			Obj()
+		preemptor := testing.MakeWorkload("preemptor", ns.Name).
+			Priority(10).
+			Queue(kueue.LocalQueueName(lq.Name)).
+			PodSets(*testing.MakePodSet("main", 4).Request(corev1.ResourceCPU, "1").Obj()).
+			Obj()
+		util.MustCreate(ctx, k8sClient, victim)
+		util.MustCreate(ctx, k8sClient, blocker)
+		util.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, victim, blocker)
+
+		ginkgo.By("Creating the preemptor requests enough quota to partially preempt the victim")
+		util.MustCreate(ctx, k8sClient, preemptor)
+		expectReclaimTargetCount(victim, ptr.To[int32](2))
+		gomega.Consistently(func(g gomega.Gomega) {
+			got := &kueue.Workload{}
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(victim), got)).Should(gomega.Succeed())
+			g.Expect(ptr.Deref(got.Status.Admission.PodSetAssignments[0].Count, -1)).Should(gomega.BeEquivalentTo(int32(6)))
+		}, util.ConsistentDuration, util.Interval).Should(gomega.Succeed())
+		gomega.Consistently(func(g gomega.Gomega) {
+			got := &kueue.Workload{}
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(preemptor), got)).Should(gomega.Succeed())
+			g.Expect(workload.IsAdmitted(got)).Should(gomega.BeFalse())
+		}, util.ConsistentDuration, util.Interval).Should(gomega.Succeed())
+
+		ginkgo.By("Scaling the victim down to the reclaim target clears reclaimTargetCount")
+		setResizeCount(victim, 2)
+		expectAdmittedCount(victim, 2)
+		expectReclaimTargetCount(victim, nil)
+		util.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, preemptor)
+		expectCQUsage("10")
+
+		ginkgo.By("Deleting the competing workloads frees quota so the victim can scale up again")
+		util.ExpectObjectToBeDeleted(ctx, k8sClient, preemptor, true)
+		util.ExpectObjectToBeDeleted(ctx, k8sClient, blocker, true)
+
+		ginkgo.By("Scaling up again works because the stale target was cleared")
+		setResizeCount(victim, 10)
+		expectAdmittedCount(victim, 10)
+		expectReclaimTargetCount(victim, nil)
+		expectCQUsage("10")
+	})
 })

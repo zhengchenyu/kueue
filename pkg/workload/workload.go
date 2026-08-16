@@ -215,6 +215,33 @@ type Info struct {
 	// NominationMapping is the mapping of PodSets resources and their flavors
 	// based on the nomination phase.
 	NominationMapping PodSetResourcesToFlavors
+
+	// IsPartialPreemptionJob indicates whether this workload is an elastic job that has
+	// opted in to partial preemption (PartialPreemption gate on + annotation set).
+	// Computed once at Info construction time so comparators and iterators avoid
+	// per-call featureGate lookups and annotation map access.
+	IsPartialPreemptionJob bool
+
+	// HasPendingReclaimTarget indicates whether this workload has any admitted PodSet with
+	// an in-flight partial-preemption reclaim target above its current count.
+	HasPendingReclaimTarget bool
+
+	// PreemptionTargetSlot records this workload's index in the preemption targets slice within a
+	// single attempt (sentinel-0 encoded: 0 = unset). Owned by the preemption package.
+	PreemptionTargetSlot int
+}
+
+// SetPreemptionTargetSlot stores idx as the slot, sentinel-0 encoded (idx+1).
+func (i *Info) SetPreemptionTargetSlot(idx int) {
+	i.PreemptionTargetSlot = idx + 1
+}
+
+// GetPreemptionTargetSlot returns the stored slot and whether it was set.
+func (i *Info) GetPreemptionTargetSlot() (int, bool) {
+	if i.PreemptionTargetSlot == 0 {
+		return 0, false
+	}
+	return i.PreemptionTargetSlot - 1, true
 }
 
 type PodSetResources struct {
@@ -319,6 +346,8 @@ func (i *Info) Update(log logr.Logger, wl *kueue.Workload, opts ...InfoOption) {
 	if i.shouldUpdateDerivedFields(prev) {
 		i.updateDerivedFields(log)
 	}
+	i.IsPartialPreemptionJob = IsPartialPreemptionJob(wl)
+	i.HasPendingReclaimTarget = HasPendingReclaimTargetCount(wl)
 }
 
 // schedulingHashInputs is what an Info's SchedulingHash was computed from,

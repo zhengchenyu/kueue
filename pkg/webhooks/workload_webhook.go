@@ -137,6 +137,20 @@ func ValidateWorkload(obj, oldObj *kueue.Workload) field.ErrorList {
 		allErrs = append(allErrs, field.Invalid(specPath.Child("podSets"), variableCountPodSets, "partial admission and elastic job cannot be used together"))
 	}
 
+	// Elastic jobs (workload-slices) are incompatible with topology-aware scheduling.
+	if features.Enabled(features.ElasticJobsViaWorkloadSlices) && workloadslicing.Enabled(obj) {
+		for i := range obj.Spec.PodSets {
+			ps := &obj.Spec.PodSets[i]
+			if ps.TopologyRequest != nil {
+				allErrs = append(allErrs, field.Invalid(
+					specPath.Child("podSets").Index(i).Child("topologyRequest"),
+					ps.TopologyRequest,
+					"topology-aware scheduling cannot be used with elastic jobs",
+				))
+			}
+		}
+	}
+
 	statusPath := field.NewPath("status")
 	if workload.HasQuotaReservation(obj) {
 		allErrs = append(allErrs, validateAdmission(obj, oldObj, statusPath.Child("admission"))...)
@@ -407,6 +421,21 @@ func validateAdmissionUpdate(new, old *kueue.Admission, path *field.Path) field.
 		for i := range new.PodSetAssignments {
 			old.PodSetAssignments[i].TopologyAssignment = new.PodSetAssignments[i].TopologyAssignment
 			old.PodSetAssignments[i].DelayedTopologyRequest = new.PodSetAssignments[i].DelayedTopologyRequest
+		}
+	}
+	if features.Enabled(features.ElasticJobsViaWorkloadSlices) && len(new.PodSetAssignments) == len(old.PodSetAssignments) {
+		// Allow Kueue to update the admitted counts (and the proportional resource usage) of an
+		// already-admitted workload-slices elastic Workload. ClusterQueue and Flavors stay immutable.
+		for i := range new.PodSetAssignments {
+			old.PodSetAssignments[i].Count = new.PodSetAssignments[i].Count
+			old.PodSetAssignments[i].ResourceUsage = new.PodSetAssignments[i].ResourceUsage
+		}
+	}
+	if features.Enabled(features.PartialPreemption) && len(new.PodSetAssignments) == len(old.PodSetAssignments) {
+		// Kueue owns reclaimTargetCount and updates it on an already-admitted Workload to request (or
+		// clear) a partial-preemption scale-down; allow it to change.
+		for i := range new.PodSetAssignments {
+			old.PodSetAssignments[i].ReclaimTargetCount = new.PodSetAssignments[i].ReclaimTargetCount
 		}
 	}
 	return apivalidation.ValidateImmutableField(new, old, path)

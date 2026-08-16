@@ -98,9 +98,19 @@ func fairPreemptionStrategy(
 			return yieldAndRecord(t)
 		}
 
+		// fitsWithoutSimulation checks whether the preemptor fits when the simulated
+		// incoming workload usage is NOT counted — this is the condition that must hold
+		// for the real admission decision. searchPartialReduction uses this closure, and
+		// it must not be fooled by the temporary SimulateUsageAddition below.
+		fitsWithoutSimulation := func() bool {
+			revert := preemptionCtx.preemptorCQ.SimulateUsageRemoval(preemptionCtx.workloadUsage)
+			defer revert()
+			return workloadQuotaFits(preemptionCtx, allowBorrowing)
+		}
+
 		revertSimulation := preemptionCtx.preemptorCQ.SimulateUsageAddition(preemptionCtx.workloadUsage)
 
-		candidateWls, cont = iterateWithFirstFsStrategy(log, preemptionCtx, candidateWls, fsStrategies[0], func(t *Target) bool {
+		candidateWls, cont = iterateWithFirstFsStrategy(log, preemptionCtx, candidateWls, fsStrategies[0], fitsWithoutSimulation, func(t *Target) bool {
 			if t.WorkloadInfo.ClusterQueue == preemptionCtx.preemptorCQ.Name {
 				targetsInPreemptorCQ = true
 			}
@@ -114,7 +124,7 @@ func fairPreemptionStrategy(
 			// succeed now.
 			// No need to run the strategy a third time as first run already iterated
 			// though whole tree and removed all the preemptor's workloads.
-			candidateWls, cont = iterateWithFirstFsStrategy(log, preemptionCtx, candidateWls, fsStrategies[0], yieldWithoutSimulatedUsage)
+			candidateWls, cont = iterateWithFirstFsStrategy(log, preemptionCtx, candidateWls, fsStrategies[0], fitsWithoutSimulation, yieldWithoutSimulatedUsage)
 		}
 
 		if cont && len(fsStrategies) > 1 {
@@ -124,7 +134,7 @@ func fairPreemptionStrategy(
 					"targets", logging.GetObjectReferences(yieldedCandidates),
 					"retryCandidates", workload.References(candidateWls))
 			}
-			cont = iterateWithSecondFsStrategy(log, preemptionCtx, candidateWls, yieldWithoutSimulatedUsage)
+			cont = iterateWithSecondFsStrategy(log, preemptionCtx, candidateWls, fitsWithoutSimulation, yieldWithoutSimulatedUsage)
 		}
 
 		revertSimulation()
@@ -146,6 +156,14 @@ func fairPreemptionStrategy(
 		}
 	}
 
+	// fitsWithoutSimulation is defined in the closure so it can be passed as the
+	// strategy's fits function. The same closure is reused inside candidatesIter.
+	fitsWithoutSimulationForStrategy := func() bool {
+		revert := preemptionCtx.preemptorCQ.SimulateUsageRemoval(preemptionCtx.workloadUsage)
+		defer revert()
+		return workloadQuotaFits(preemptionCtx, allowBorrowing)
+	}
+
 	return func(yieldStrategy func(PreemptionStrategy) bool) {
 		yieldStrategy(newPreemptionStrategy(
 			candidatesIter,
@@ -154,6 +172,7 @@ func fairPreemptionStrategy(
 			withVerify(func(targets []*Target) (bool, string) {
 				return verifyFairSharingTargets(preemptionCtx, targets, fsStrategies)
 			}),
+			withFits(fitsWithoutSimulationForStrategy),
 		))
 	}
 }
@@ -245,8 +264,13 @@ func iterateWithFirstFsStrategy(
 	preemptionCtx *preemptionCtx,
 	candidates []*workload.Info,
 	fsStrategy fairsharing.Strategy,
+	fits func() bool,
 	yield func(*Target) bool,
 ) (retryCandidates []*workload.Info, cont bool) {
+	// planPreemption must be called before YieldFromSnapshot wraps yield, because
+	// searchPartialReduction (called inside planPreemption) needs the candidate still
+	// present in the snapshot. YieldFromSnapshot removes the candidate before calling
+	// the inner yield.
 	yield = policy.YieldFromSnapshot(preemptionCtx.snapshot, yield)
 	ordering := fairsharing.MakeClusterQueueOrdering(preemptionCtx.preemptorCQ, candidates, preemptionCtx.frsNeedPreemption, log, preemptionCtx.clock)
 	// If the preemptor CQ stays within nominal quota for the contested
@@ -260,7 +284,9 @@ func iterateWithFirstFsStrategy(
 	for candCQ := range ordering.Iter() {
 		if candCQ.InClusterQueuePreemption() {
 			candWl := candCQ.PopWorkload()
-			if !yield(&Target{WorkloadInfo: candWl, Reason: kueue.InClusterQueueReason, WorkloadCq: candCQ.GetTargetCq()}) {
+			plan := planPreemption(preemptionCtx, candWl, kueue.InClusterQueueReason, fits)
+			plan.target.WorkloadCq = candCQ.GetTargetCq()
+			if !yield(plan.target) {
 				return
 			}
 			continue
@@ -268,7 +294,9 @@ func iterateWithFirstFsStrategy(
 
 		if preemptorWithinNominal {
 			candWl := candCQ.PopWorkload()
-			if !yield(&Target{WorkloadInfo: candWl, Reason: kueue.InCohortReclamationReason, WorkloadCq: candCQ.GetTargetCq()}) {
+			plan := planPreemption(preemptionCtx, candWl, kueue.InCohortReclamationReason, fits)
+			plan.target.WorkloadCq = candCQ.GetTargetCq()
+			if !yield(plan.target) {
 				return
 			}
 			continue
@@ -294,11 +322,20 @@ func iterateWithFirstFsStrategy(
 		strategyLog := newFsStrategyLog(log, candCQ, preemptorNewShare, targetOldShare)
 		for candCQ.HasWorkload() {
 			candWl := candCQ.PopWorkload()
-			targetNewShare := candCQ.ComputeTargetShareAfterRemoval(candWl)
+			// planPreemption must be called before computing targetNewShare so that
+			// partial preemption candidates use only their reclaimed slice
+			// (plan.freedQuotaUsage()) rather than their full usage. Using full usage
+			// here would drop the target CQ's share to zero for a workload that is
+			// only partially reclaimed, causing LessThanOrEqualToFinalShare to fail
+			// even when the reclaimed slice is small enough to make the check pass.
+			// planPreemption does not commit to the snapshot, so this is safe.
+			plan := planPreemption(preemptionCtx, candWl, kueue.InCohortFairSharingReason, fits)
+			targetNewShare := candCQ.ComputeTargetShareAfterRemovalUsage(plan.freedQuotaUsage())
 			passed := fsStrategy(preemptorNewShare, targetOldShare, targetNewShare)
 			strategyLog.record(candWl, targetNewShare, passed)
 			if passed {
-				if !yield(&Target{WorkloadInfo: candWl, Reason: kueue.InCohortFairSharingReason, WorkloadCq: candCQ.GetTargetCq()}) {
+				plan.target.WorkloadCq = candCQ.GetTargetCq()
+				if !yield(plan.target) {
 					strategyLog.flush()
 					return
 				}
@@ -319,8 +356,13 @@ func iterateWithSecondFsStrategy(
 	log logr.Logger,
 	preemptionCtx *preemptionCtx,
 	retryCandidates []*workload.Info,
+	fits func() bool,
 	yield func(*Target) bool,
 ) bool {
+	// planPreemption must be called before YieldFromSnapshot wraps yield, because
+	// searchPartialReduction (called inside planPreemption) needs the candidate still
+	// present in the snapshot. YieldFromSnapshot removes the candidate before calling
+	// the inner yield.
 	yield = policy.YieldFromSnapshot(preemptionCtx.snapshot, yield)
 	ordering := fairsharing.MakeClusterQueueOrdering(preemptionCtx.preemptorCQ, retryCandidates, preemptionCtx.frsNeedPreemption, log, preemptionCtx.clock)
 	for candCQ := range ordering.Iter() {
@@ -339,7 +381,9 @@ func iterateWithSecondFsStrategy(
 		// Due to API validation, we can only reach here if the second strategy is LessThanInitialShare,
 		// in which case the last parameter for the strategy function is irrelevant.
 		if passed {
-			if !yield(&Target{WorkloadInfo: candWl, Reason: kueue.InCohortFairSharingReason, WorkloadCq: candCQ.GetTargetCq()}) {
+			plan := planPreemption(preemptionCtx, candWl, kueue.InCohortFairSharingReason, fits)
+			plan.target.WorkloadCq = candCQ.GetTargetCq()
+			if !yield(plan.target) {
 				return false
 			}
 		}

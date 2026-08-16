@@ -29,6 +29,7 @@ import (
 	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/component-base/featuregate"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
@@ -1602,6 +1603,88 @@ func TestWorkloadWebhookDefault(t *testing.T) {
 				if cleared := ps.MinCount == nil; cleared != tc.wantCleared {
 					t.Errorf("podSet %q: minCount cleared = %v, want %v", ps.Name, cleared, tc.wantCleared)
 				}
+			}
+		})
+	}
+}
+
+// admittedWLMinCount returns an admitted Workload with the given spec/admitted/min counts.
+func admittedWLMinCount(specCount, admittedCount, minCount int32, now time.Time) *kueue.Workload {
+	return utiltestingapi.MakeWorkload("wl", "ns").
+		Annotation(constants.PartialPreemptionAnnotation, "true").
+		PodSets(*utiltestingapi.MakePodSet("main", int(specCount)).
+			Request(corev1.ResourceCPU, "1").
+			SetMinimumCount(minCount).
+			Obj()).
+		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").
+			PodSets(utiltestingapi.MakePodSetAssignment("main").
+				Assignment(corev1.ResourceCPU, "default", "1").
+				Count(admittedCount).
+				Obj()).
+			Obj(), now).
+		Obj()
+}
+
+// TestValidateWorkloadResizeRejectsTAS verifies that a resize-elastic workload requesting
+// topology-aware scheduling is rejected (the combination is unsupported), while the same PodSet
+// without the elastic-job annotation is accepted.
+func TestValidateWorkloadResizeRejectsTAS(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
+
+	tasPodSet := func() kueue.PodSet {
+		return *utiltestingapi.MakePodSet("main", 2).
+			RequiredTopologyRequest("cloud.com/block").
+			Request(corev1.ResourceCPU, "1").Obj()
+	}
+
+	t.Run("resize-elastic + TAS is rejected", func(t *testing.T) {
+		wl := utiltestingapi.MakeWorkload("wl", "ns").
+			Annotation(constants.ElasticJobAnnotation, "true").
+			PodSets(tasPodSet()).
+			Obj()
+		if errs := ValidateWorkload(wl, nil); len(errs) == 0 {
+			t.Errorf("ValidateWorkload() returned no error for a resize-elastic workload requesting TAS; want a validation error")
+		}
+	})
+
+	t.Run("non-resize + TAS is allowed", func(t *testing.T) {
+		wl := utiltestingapi.MakeWorkload("wl", "ns").
+			PodSets(tasPodSet()).
+			Obj()
+		if errs := ValidateWorkload(wl, nil); len(errs) != 0 {
+			t.Errorf("ValidateWorkload() returned errors for a non-resize workload requesting TAS: %v", errs)
+		}
+	})
+}
+
+// TestValidateWorkloadUpdatePartialPreemptionTargetCount verifies that Kueue may set/change the
+// admission targetCount (the partial-preemption scale-down request) on an already-admitted Workload
+// only when the PartialPreemption feature gate is enabled; otherwise it stays immutable.
+func TestValidateWorkloadUpdatePartialPreemptionTargetCount(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	withTargetCount := func(wl *kueue.Workload, tc int32) *kueue.Workload {
+		out := wl.DeepCopy()
+		out.Status.Admission.PodSetAssignments[0].ReclaimTargetCount = ptr.To(tc)
+		return out
+	}
+	cases := map[string]struct {
+		gate    bool
+		wantErr bool
+	}{
+		"gate on: setting targetCount is allowed":               {gate: true, wantErr: false},
+		"gate off: setting targetCount is rejected (immutable)": {gate: false, wantErr: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
+			features.SetFeatureGateDuringTest(t, features.PartialPreemption, tc.gate)
+
+			before := admittedWLMinCount(5, 5, 1, now)
+			after := withTargetCount(before, 1)
+
+			errList := ValidateWorkloadUpdate(after, before)
+			if gotErr := len(errList) > 0; gotErr != tc.wantErr {
+				t.Errorf("ValidateWorkloadUpdate() error = %v (wantErr %v): %v", gotErr, tc.wantErr, errList)
 			}
 		})
 	}

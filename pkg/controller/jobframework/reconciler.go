@@ -729,6 +729,50 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// 8a. handle partial preemption.
+	// If the workload has a pending ReclaimTargetCount the job must scale down to
+	// the requested target count. While that target is still pending we also block
+	// any scale-up: if the job's current pod count exceeds the target (e.g. the
+	// user manually raised spec.parallelism before the reclaim completed) we stop
+	// the job so it cannot consume more quota than the scheduler allowed.
+	if ppJob, ok := job.(JobWithPartialPreemption); ok {
+		if workload.HasPendingReclaimTargetCount(wl) {
+			log.V(3).Info("Handling partial preemption scale-down")
+			if err := ppJob.RespondToPartialPreemption(ctx, r.client, wl); err != nil {
+				log.Error(err, "Responding to partial preemption")
+				return ctrl.Result{}, err
+			}
+			// Block scale-up while the reclaim target is still in flight.
+			// If the job somehow has more pods than the target (e.g. a concurrent
+			// manual edit), suspend it so quota is not over-consumed.
+			currentPodSets, err := job.PodSets(ctx, r.client)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			// Build a map of current counts by PodSet name for fast lookup.
+			currentCounts := make(map[kueue.PodSetReference]int32, len(currentPodSets))
+			for _, ps := range currentPodSets {
+				currentCounts[kueue.PodSetReference(ps.Name)] = ps.Count
+			}
+			for _, psa := range wl.Status.Admission.PodSetAssignments {
+				if psa.ReclaimTargetCount == nil {
+					continue
+				}
+				if cur, ok := currentCounts[psa.Name]; ok && cur > *psa.ReclaimTargetCount {
+					log.V(2).Info("Blocking scale-up while ReclaimTargetCount is pending",
+						"podSet", psa.Name,
+						"currentCount", cur,
+						"reclaimTargetCount", *psa.ReclaimTargetCount)
+					if err := r.stopJob(ctx, job, wl, StopReasonWorkloadEvicted,
+						"parallelism exceeds pending ReclaimTargetCount"); err != nil {
+						return ctrl.Result{}, err
+					}
+					return ctrl.Result{}, nil
+				}
+			}
+		}
+	}
+
 	// Workload is admitted and job is running, nothing to do. For elastic jobs,
 	// pod ungating is handled by the ElasticJobUngater controller.
 	log.V(3).Info("Job running with admitted workload, nothing to do")
@@ -2104,6 +2148,15 @@ func (r *JobReconciler) prepareWorkload(ctx context.Context, job GenericJob, wl 
 
 	if err := PrepareWorkloadPriority(ctx, r.client, r.record, job.Object(), wl, getCustomPriorityClassFuncFromJob(job)); err != nil {
 		return err
+	}
+
+	// Propagate the partial-preemption opt-in from the job to the workload so the scheduler can
+	// decide partial preemption at the workload level (without accessing the Job).
+	if job.Object().GetAnnotations()[constants.PartialPreemptionAnnotation] == "true" {
+		metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.PartialPreemptionAnnotation, "true")
+	}
+	if maxReclaimedCount := job.Object().GetAnnotations()[constants.PartialPreemptionMaxReclaimedCountAnnotation]; maxReclaimedCount != "" {
+		metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.PartialPreemptionMaxReclaimedCountAnnotation, maxReclaimedCount)
 	}
 
 	// Elastic jobs only get their elastic annotation in prepareWorkloadSlice, so it must run before
