@@ -50,12 +50,24 @@ func byName(a, b *workload.Info) int {
 	return strings.Compare(a.Obj.Name, b.Obj.Name)
 }
 
-func segmentBucket(sorted []*workload.Info, advantage bool) *bucket {
-	return &bucket{
+func makeWorkloadCQ(infos []*workload.Info) *schdcache.ClusterQueueSnapshot {
+	cq := &schdcache.ClusterQueueSnapshot{
+		Workloads: make(map[workload.Reference]*workload.Info, len(infos)),
+	}
+	for _, wl := range infos {
+		cq.Workloads[workload.Key(wl.Obj)] = wl
+	}
+	return cq
+}
+
+func segmentBucket(sortedWorkloads []*workload.Info, advantage bool) *bucket {
+	b := &bucket{
+		cq:                       makeWorkloadCQ(sortedWorkloads),
 		isSameQueue:              true,
 		hasHierarchicalAdvantage: advantage,
-		sorted:                   sorted,
+		sortedWorkloads:          sortedWorkloads,
 	}
+	return b
 }
 
 func drainIter(it *cacheCandidateIterator, borrow bool) []string {
@@ -140,6 +152,42 @@ func TestCacheIterator(t *testing.T) {
 			borrow: false,
 			want:   []string{"real1", "real2"},
 		},
+		"workloads removed from the Snapshot are silently skipped": {
+			ctx: ctxWithin,
+			segments: func() [numSegments][]*bucket {
+				var s [numSegments][]*bucket
+				bkt := segmentBucket([]*workload.Info{a, b, c}, false)
+				delete(bkt.cq.Workloads, workload.Key(b.Obj))
+				s[0] = []*bucket{bkt}
+				return s
+			}(),
+			borrow: false,
+			want:   []string{"a", "c"},
+		},
+		"first workload removed from the Snapshot is skipped": {
+			ctx: ctxWithin,
+			segments: func() [numSegments][]*bucket {
+				var s [numSegments][]*bucket
+				bkt := segmentBucket([]*workload.Info{a, b, c}, false)
+				delete(bkt.cq.Workloads, workload.Key(a.Obj))
+				s[0] = []*bucket{bkt}
+				return s
+			}(),
+			borrow: false,
+			want:   []string{"b", "c"},
+		},
+		"bucket with all workloads removed from the Snapshot is exhausted": {
+			ctx: ctxWithin,
+			segments: func() [numSegments][]*bucket {
+				var s [numSegments][]*bucket
+				bkt := segmentBucket([]*workload.Info{a, b, c}, false)
+				clear(bkt.cq.Workloads)
+				s[0] = []*bucket{bkt}
+				return s
+			}(),
+			borrow: false,
+			want:   nil,
+		},
 		"borrow run skips ReclaimWithoutBorrowing; non-borrow run after Reset sees them": {
 			ctx: ctxReclaim,
 			segments: func() [numSegments][]*bucket {
@@ -170,6 +218,62 @@ func TestCacheIterator(t *testing.T) {
 	}
 }
 
+func TestResetSkipsWorkloadsRemovedFromSnapshot(t *testing.T) {
+	cases := map[string]struct {
+		removed []string
+		want    []string
+	}{
+		"first workload": {
+			removed: []string{"a"},
+			want:    []string{"b", "c"},
+		},
+		"middle workload": {
+			removed: []string{"b"},
+			want:    []string{"a", "c"},
+		},
+		"last workload": {
+			removed: []string{"c"},
+			want:    []string{"a", "b"},
+		},
+		"all workloads": {
+			removed: []string{"a", "b", "c"},
+			want:    nil,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			workloads := []*workload.Info{
+				candidateInfo(t, "a", preemptorCQName, 1),
+				candidateInfo(t, "b", preemptorCQName, 1),
+				candidateInfo(t, "c", preemptorCQName, 1),
+			}
+			workloadsByName := make(map[string]*workload.Info, len(workloads))
+			for _, wl := range workloads {
+				workloadsByName[wl.Obj.Name] = wl
+			}
+			bkt := segmentBucket(workloads, false)
+			it := &cacheCandidateIterator{
+				segments:               [numSegments][]*bucket{{bkt}},
+				cmp:                    byName,
+				hierarchicalReclaimCtx: preemptorCtx(t, 10, kueue.PreemptionPolicyAny, kueue.PreemptionPolicyNever, nil),
+			}
+
+			if got, want := drainIter(it, false), []string{"a", "b", "c"}; !slices.Equal(got, want) {
+				t.Fatalf("first pass = %v, want %v", got, want)
+			}
+
+			for _, removed := range tc.removed {
+				delete(bkt.cq.Workloads, workload.Key(workloadsByName[removed].Obj))
+			}
+			it.Reset()
+			if got := drainIter(it, false); !slices.Equal(got, tc.want) {
+				t.Errorf("after Reset = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestBucketCursor(t *testing.T) {
 	w := []*workload.Info{
 		{Obj: utiltestingapi.MakeWorkload("a", "ns").Obj()},
@@ -178,7 +282,7 @@ func TestBucketCursor(t *testing.T) {
 	}
 
 	t.Run("forward consumption", func(t *testing.T) {
-		b := &bucket{sorted: w}
+		b := segmentBucket(w, false)
 		got := []string{}
 		for !b.empty() {
 			got = append(got, b.top().Obj.Name)
@@ -193,14 +297,14 @@ func TestBucketCursor(t *testing.T) {
 	})
 
 	t.Run("empty slice", func(t *testing.T) {
-		b := &bucket{sorted: nil}
+		b := segmentBucket(nil, false)
 		if !b.empty() {
 			t.Error("nil-backed bucket should be empty")
 		}
 	})
 
 	t.Run("drain exhausts immediately", func(t *testing.T) {
-		b := &bucket{sorted: w}
+		b := segmentBucket(w, false)
 		if b.empty() {
 			t.Fatal("bucket should start non-empty")
 		}
@@ -210,8 +314,8 @@ func TestBucketCursor(t *testing.T) {
 		}
 	})
 
-	t.Run("reset rewinds after advance", func(t *testing.T) {
-		b := &bucket{sorted: w}
+	t.Run("reset rewinds after cursor movement", func(t *testing.T) {
+		b := segmentBucket(w, false)
 		b.advance()
 		b.advance()
 		b.reset()
@@ -221,7 +325,7 @@ func TestBucketCursor(t *testing.T) {
 	})
 
 	t.Run("reset rewinds after drain", func(t *testing.T) {
-		b := &bucket{sorted: w}
+		b := segmentBucket(w, false)
 		b.drain()
 		b.reset()
 		if b.empty() || b.top().Obj.Name != "a" {
@@ -235,9 +339,12 @@ func TestBuildBuckets(t *testing.T) {
 	n1 := evictedInfo(t, "n1", false)
 	n2 := evictedInfo(t, "n2", false)
 
-	cqA := &schdcache.ClusterQueueSnapshot{Name: "cqA"}
-	cqB := &schdcache.ClusterQueueSnapshot{Name: "cqB"}
-	cqEmpty := &schdcache.ClusterQueueSnapshot{Name: "cqEmpty"}
+	cqA := segmentBucket([]*workload.Info{e, n1}, false).cq
+	cqA.Name = "cqA"
+	cqB := segmentBucket([]*workload.Info{n2}, false).cq
+	cqB.Name = "cqB"
+	cqEmpty := segmentBucket(nil, false).cq
+	cqEmpty.Name = "cqEmpty"
 
 	cases := map[string]struct {
 		classes           []classifiedClusterQueue
@@ -252,11 +359,11 @@ func TestBuildBuckets(t *testing.T) {
 				// cqA has both an evicted prefix (evictedCount=1) and a non-evicted tail.
 				// buildBuckets splits at the cache-computed evictedCount, not by re-probing
 				// the workload conditions.
-				{cq: cqA, sorted: []*workload.Info{e, n1}, evictedCount: 1},
+				{cq: cqA, sortedWorkloads: []*workload.Info{e, n1}, evictedCount: 1},
 				// cqB has only a non-evicted workload.
-				{cq: cqB, sorted: []*workload.Info{n2}, evictedCount: 0},
+				{cq: cqB, sortedWorkloads: []*workload.Info{n2}, evictedCount: 0},
 				// cqEmpty contributes nothing.
-				{cq: cqEmpty, sorted: nil},
+				{cq: cqEmpty, sortedWorkloads: nil},
 			},
 			wantEvicted:       1,
 			wantNonEvicted:    2,

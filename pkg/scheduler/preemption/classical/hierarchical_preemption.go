@@ -126,13 +126,13 @@ func isAboveBorrowingThreshold(candidatePriority, incomingPriority int64, borrow
 // preemptor: which category the CQ falls into and the lca used for pruning. It
 // carries no materialized workloads. The ordered candidates are the CQ's
 // cycle-level sorted slice (owned by the CandidateOrderCache), attached later
-// into sorted and consumed lazily.
+// into sortedWorkloads and consumed lazily.
 type classifiedClusterQueue struct {
 	cq                       *schdcache.ClusterQueueSnapshot
 	lca                      *schdcache.CohortSnapshot
 	hasHierarchicalAdvantage bool
 	isSameQueue              bool
-	sorted                   []*workload.Info
+	sortedWorkloads          []*workload.Info
 	evictedCount             int
 }
 

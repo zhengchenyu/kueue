@@ -82,31 +82,31 @@ func TestBuildCandidateOrderEntry(t *testing.T) {
 	n2 := evictedInfo(t, "n2", false)
 
 	cases := map[string]struct {
-		cq          *ClusterQueueSnapshot
-		wantSorted  []string
-		wantEvicted int
+		cq                  *ClusterQueueSnapshot
+		wantSortedWorkloads []string
+		wantEvicted         int
 	}{
 		"mixed evicted and non-evicted are sorted with evicted prefix": {
-			cq:          cqWith("cq", n2, e2, n1, e1),
-			wantSorted:  []string{"e1", "e2", "n1", "n2"},
-			wantEvicted: 2,
+			cq:                  cqWith("cq", n2, e2, n1, e1),
+			wantSortedWorkloads: []string{"e1", "e2", "n1", "n2"},
+			wantEvicted:         2,
 		},
 		"only non-evicted workloads produce zero evicted prefix": {
-			cq:          cqWith("cq", n2, n1),
-			wantSorted:  []string{"n1", "n2"},
-			wantEvicted: 0,
+			cq:                  cqWith("cq", n2, n1),
+			wantSortedWorkloads: []string{"n1", "n2"},
+			wantEvicted:         0,
 		},
 		"only evicted workloads produce full-length evicted prefix": {
-			cq:          cqWith("cq", e2, e1),
-			wantSorted:  []string{"e1", "e2"},
-			wantEvicted: 2,
+			cq:                  cqWith("cq", e2, e1),
+			wantSortedWorkloads: []string{"e1", "e2"},
+			wantEvicted:         2,
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			e := buildCandidateOrderEntry(tc.cq, orderCmp)
-			if got := names(e.workloads); !slices.Equal(got, tc.wantSorted) {
-				t.Errorf("sorted names = %v, want %v", got, tc.wantSorted)
+			if got := names(e.sortedWorkloads); !slices.Equal(got, tc.wantSortedWorkloads) {
+				t.Errorf("sorted names = %v, want %v", got, tc.wantSortedWorkloads)
 			}
 			if e.evictedCount != tc.wantEvicted {
 				t.Errorf("evictedCount = %d, want %d", e.evictedCount, tc.wantEvicted)
@@ -163,8 +163,33 @@ func TestGetInvalidatesOnMembershipChange(t *testing.T) {
 	}
 }
 
-// TestMatches covers the per-read validation: an entry matches only when its
-// length and every member key still line up with the CQ's current workloads.
+func TestGetReusesEntryAfterSnapshotRemovalAndRestore(t *testing.T) {
+	cache := newCandidateOrderCache()
+	n1 := evictedInfo(t, "n1", false)
+	n2 := evictedInfo(t, "n2", false)
+	cq := cqWith("cq", n1, n2)
+
+	cache.Get(cq, orderCmp)
+	if cache.entries[cq.Name] == nil {
+		t.Fatal("initial Get did not build an entry")
+	}
+	entry := cache.entries[cq.Name]
+
+	delete(cq.Workloads, workload.Key(n2.Obj))
+	cache.Get(cq, orderCmp)
+	if cache.entries[cq.Name] != entry {
+		t.Error("Get rebuilt the entry after a workload was removed from the Snapshot")
+	}
+
+	cq.Workloads[workload.Key(n2.Obj)] = n2
+	cache.Get(cq, orderCmp)
+	if cache.entries[cq.Name] != entry {
+		t.Error("Get rebuilt the entry after the workload was restored to the Snapshot")
+	}
+}
+
+// TestMatches covers the per-read validation: an entry matches when every
+// current CQ workload key is covered by the cached ordering.
 func TestMatches(t *testing.T) {
 	n1 := evictedInfo(t, "n1", false)
 	n2 := evictedInfo(t, "n2", false)
@@ -180,12 +205,16 @@ func TestMatches(t *testing.T) {
 			cq:   base,
 			want: true,
 		},
-		"shorter CQ after removal does not match": {
+		"shorter CQ after removal reuses the cached ordering": {
 			cq:   cqWith("cq", n1),
-			want: false,
+			want: true,
 		},
 		"same length but different key does not match": {
 			cq:   cqWith("cq", n1, n3),
+			want: false,
+		},
+		"larger CQ does not match": {
+			cq:   cqWith("cq", n1, n2, n3),
 			want: false,
 		},
 	}
@@ -213,7 +242,7 @@ func TestWarm(t *testing.T) {
 		if !okA || !okB {
 			t.Fatalf("Warm did not populate both entries: a=%v b=%v", okA, okB)
 		}
-		if got, want := names(entryA.workloads), []string{"e1", "n1"}; !slices.Equal(got, want) {
+		if got, want := names(entryA.sortedWorkloads), []string{"e1", "n1"}; !slices.Equal(got, want) {
 			t.Errorf("warmed a sorted = %v, want %v", got, want)
 		}
 	})

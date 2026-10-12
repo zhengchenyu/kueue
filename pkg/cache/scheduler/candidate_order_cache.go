@@ -22,6 +22,8 @@ import (
 	"slices"
 	"sort"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/util/parallelize"
 	"sigs.k8s.io/kueue/pkg/workload"
@@ -39,8 +41,10 @@ type CandidateOrderCache struct {
 }
 
 type candidateOrderEntry struct {
-	// workloads holds the CQ's workloads ordered by the comparator.
-	workloads []*workload.Info
+	// sortedWorkloads holds the CQ's workloads ordered by the comparator.
+	sortedWorkloads []*workload.Info
+	// workloadKeys contains the workload membership used to build sortedWorkloads.
+	workloadKeys sets.Set[workload.Reference]
 	// evictedCount is the length of the evicted prefix of workloads.
 	evictedCount int
 }
@@ -51,16 +55,16 @@ func newCandidateOrderCache() *CandidateOrderCache {
 	}
 }
 
-// Get returns the CQ's workloads sorted by cmp together with the length of their
-// evicted prefix, building the entry on first use and reusing it while membership
-// is unchanged.
+// Get returns the CQ's cached workload ordering together with the length of its
+// evicted prefix, building the entry on first use and reusing it while the
+// current workloads are covered by the cached ordering.
 func (c *CandidateOrderCache) Get(cq *ClusterQueueSnapshot, cmp CandidateOrderComparator) ([]*workload.Info, int) {
 	if e, ok := c.entries[cq.Name]; ok && matches(e, cq) {
-		return e.workloads, e.evictedCount
+		return e.sortedWorkloads, e.evictedCount
 	}
 	e := buildCandidateOrderEntry(cq, cmp)
 	c.entries[cq.Name] = e
-	return e.workloads, e.evictedCount
+	return e.sortedWorkloads, e.evictedCount
 }
 
 // Warm builds the entries for the given ClusterQueues concurrently.
@@ -86,23 +90,32 @@ func (c *CandidateOrderCache) Warm(cqs []*ClusterQueueSnapshot, cmp CandidateOrd
 }
 
 func buildCandidateOrderEntry(cq *ClusterQueueSnapshot, cmp CandidateOrderComparator) *candidateOrderEntry {
-	sorted := slices.AppendSeq(make([]*workload.Info, 0, len(cq.Workloads)), maps.Values(cq.Workloads))
-	slices.SortFunc(sorted, cmp)
-	return &candidateOrderEntry{workloads: sorted, evictedCount: evictedPrefixLen(sorted)}
+	sortedWorkloads := slices.AppendSeq(make([]*workload.Info, 0, len(cq.Workloads)), maps.Values(cq.Workloads))
+	slices.SortFunc(sortedWorkloads, cmp)
+	return &candidateOrderEntry{
+		sortedWorkloads: sortedWorkloads,
+		workloadKeys:    sets.KeySet(cq.Workloads),
+		evictedCount:    evictedPrefixLen(sortedWorkloads),
+	}
 }
 
-func evictedPrefixLen(sorted []*workload.Info) int {
-	return sort.Search(len(sorted), func(i int) bool {
-		return !workloadevict.IsEvicted(sorted[i].Obj)
+func evictedPrefixLen(sortedWorkloads []*workload.Info) int {
+	// sortedWorkloads must place evicted workloads before non-evicted workloads,
+	// so the evicted workloads form a prefix searched by sort.Search.
+	return sort.Search(len(sortedWorkloads), func(i int) bool {
+		return !workloadevict.IsEvicted(sortedWorkloads[i].Obj)
 	})
 }
 
 func matches(e *candidateOrderEntry, cq *ClusterQueueSnapshot) bool {
-	if len(e.workloads) != len(cq.Workloads) {
+	// Within one scheduling cycle, scheduler mutations only remove and restore
+	// existing Snapshot workloads; they don't replace values or add new keys.
+	// A current subset can therefore reuse the ordering of the original set.
+	if len(cq.Workloads) > len(e.workloadKeys) {
 		return false
 	}
-	for _, wl := range e.workloads {
-		if _, ok := cq.Workloads[workload.Key(wl.Obj)]; !ok {
+	for key := range cq.Workloads {
+		if !e.workloadKeys.Has(key) {
 			return false
 		}
 	}

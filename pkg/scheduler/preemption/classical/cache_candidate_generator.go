@@ -68,26 +68,29 @@ type bucket struct {
 	lca                      *schdcache.CohortSnapshot
 	isSameQueue              bool
 	hasHierarchicalAdvantage bool
-
-	sorted []*workload.Info
-	idx    int
+	sortedWorkloads          []*workload.Info
+	idx                      int
 }
 
 func (b *bucket) empty() bool {
-	return b.idx >= len(b.sorted)
+	return b.idx >= len(b.sortedWorkloads)
 }
 
+// top returns the workload at the current cursor position. Callers must ensure
+// idx points to a workload that is still present in the snapshot.
 func (b *bucket) top() *workload.Info {
-	return b.sorted[b.idx]
+	return b.sortedWorkloads[b.idx]
 }
 
+// advance moves the bucket cursor to the next cached workload.
+// Snapshot membership and eligibility are checked by advanceToEligible.
 func (b *bucket) advance() {
 	b.idx++
 }
 
 // drain marks the bucket exhausted (used by whole-bucket pruning).
 func (b *bucket) drain() {
-	b.idx = len(b.sorted)
+	b.idx = len(b.sortedWorkloads)
 }
 
 // reset rewinds to the starting position for the next borrow run.
@@ -99,10 +102,10 @@ func (b *bucket) reset() {
 // non-evicted buckets, one bucket each per CQ.
 func buildBuckets(classes []classifiedClusterQueue) (evicted, nonEvicted []*bucket) {
 	for _, cc := range classes {
-		if len(cc.sorted) == 0 {
+		if len(cc.sortedWorkloads) == 0 {
 			continue
 		}
-		ev, nonEv := cc.sorted[:cc.evictedCount], cc.sorted[cc.evictedCount:]
+		ev, nonEv := cc.sortedWorkloads[:cc.evictedCount], cc.sortedWorkloads[cc.evictedCount:]
 		if len(ev) > 0 {
 			evicted = append(evicted, newBucket(cc, ev))
 		}
@@ -113,22 +116,31 @@ func buildBuckets(classes []classifiedClusterQueue) (evicted, nonEvicted []*buck
 	return evicted, nonEvicted
 }
 
-func newBucket(cc classifiedClusterQueue, sorted []*workload.Info) *bucket {
+func newBucket(cc classifiedClusterQueue, sortedWorkloads []*workload.Info) *bucket {
 	return &bucket{
 		cq:                       cc.cq,
 		lca:                      cc.lca,
 		isSameQueue:              cc.isSameQueue,
 		hasHierarchicalAdvantage: cc.hasHierarchicalAdvantage,
-		sorted:                   sorted,
+		sortedWorkloads:          sortedWorkloads,
 	}
+}
+
+// inSnapshot reports whether wl is still present in cq's current workload snapshot.
+func inSnapshot(cq *schdcache.ClusterQueueSnapshot, wl *workload.Info) bool {
+	_, ok := cq.Workloads[workload.Key(wl.Obj)]
+	return ok
 }
 
 // noRealCandidate reports whether none of these classes holds a preemptible
 // workload, i.e. every workload classifies as Never.
 func noRealCandidate(ctx *HierarchicalPreemptionCtx, classes []classifiedClusterQueue) bool {
 	for _, cc := range classes {
-		for _, wl := range cc.sorted {
-			if classifyPreemptionVariant(ctx, wl, cc.hasHierarchicalAdvantage) != Never {
+		for _, cachedWl := range cc.sortedWorkloads {
+			if !inSnapshot(cc.cq, cachedWl) {
+				continue
+			}
+			if classifyPreemptionVariant(ctx, cachedWl, cc.hasHierarchicalAdvantage) != Never {
 				return false
 			}
 		}
@@ -153,7 +165,7 @@ func newCacheCandidateIterator(
 
 	sameQueueClasses := collectSameQueueCQ(hierarchicalReclaimCtx)
 	hierarchyClasses, priorityClasses := collectHierarchicalReclaimCQs(hierarchicalReclaimCtx)
-	attachSorted(cache, cmp, sameQueueClasses, hierarchyClasses, priorityClasses)
+	attachSortedWorkloads(cache, cmp, sameQueueClasses, hierarchyClasses, priorityClasses)
 
 	evictedHierarchy, nonEvictedHierarchy := buildBuckets(hierarchyClasses)
 	evictedPriority, nonEvictedPriority := buildBuckets(priorityClasses)
@@ -228,7 +240,12 @@ func (c *cacheCandidateIterator) advanceToEligible(b *bucket, borrow bool) (pree
 	}
 
 	for !b.empty() {
-		variant := classifyPreemptionVariant(c.hierarchicalReclaimCtx, b.top(), b.hasHierarchicalAdvantage)
+		cachedWorkload := b.top()
+		if !inSnapshot(b.cq, cachedWorkload) {
+			b.advance()
+			continue
+		}
+		variant := classifyPreemptionVariant(c.hierarchicalReclaimCtx, cachedWorkload, b.hasHierarchicalAdvantage)
 		if variant != Never && (!borrow || variant != ReclaimWithoutBorrowing) {
 			return variant, true
 		}
@@ -261,20 +278,18 @@ func (c *cacheCandidateIterator) Reset() {
 	}
 }
 
-// attachSorted warms the cycle-level ordering for every distinct classified
-// ClusterQueue concurrently, then fills in each class's sorted slice from the
-// cache. Warming first makes the subsequent Get calls cache hits; because the
-// entries are cycle-scoped, a CQ warmed for one preemptor is already warm for
-// the next. The sorted slice is cache-owned and read-only; the classes are
-// mutated in place by index.
-func attachSorted(cache *schdcache.CandidateOrderCache, cmp schdcache.CandidateOrderComparator, groups ...[]classifiedClusterQueue) {
-	seen := make(map[kueue.ClusterQueueReference]struct{})
+// attachSortedWorkloads warms the cycle-level ordering for every distinct
+// classified ClusterQueue concurrently, then fills in each class's
+// sortedWorkloads slice from the cache. Warming first makes the subsequent Get
+// calls cache hits.
+func attachSortedWorkloads(cache *schdcache.CandidateOrderCache, cmp schdcache.CandidateOrderComparator, groups ...[]classifiedClusterQueue) {
+	seen := sets.New[kueue.ClusterQueueReference]()
 	var cqs []*schdcache.ClusterQueueSnapshot
 	add := func(cq *schdcache.ClusterQueueSnapshot) {
-		if _, ok := seen[cq.Name]; ok {
+		if seen.Has(cq.Name) {
 			return
 		}
-		seen[cq.Name] = struct{}{}
+		seen.Insert(cq.Name)
 		cqs = append(cqs, cq)
 	}
 	for _, g := range groups {
@@ -286,7 +301,7 @@ func attachSorted(cache *schdcache.CandidateOrderCache, cmp schdcache.CandidateO
 
 	for _, g := range groups {
 		for i := range g {
-			g[i].sorted, g[i].evictedCount = cache.Get(g[i].cq, cmp)
+			g[i].sortedWorkloads, g[i].evictedCount = cache.Get(g[i].cq, cmp)
 		}
 	}
 }

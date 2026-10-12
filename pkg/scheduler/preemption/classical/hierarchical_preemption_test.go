@@ -156,6 +156,11 @@ func TestNoRealCandidate(t *testing.T) {
 	for i := range fake.TotalRequests {
 		fake.TotalRequests[i].Flavors = nil
 	}
+	class := func(infos ...*workload.Info) classifiedClusterQueue {
+		cq := makeWorkloadCQ(infos)
+		cq.Name = otherCQName
+		return classifiedClusterQueue{cq: cq, sortedWorkloads: infos}
+	}
 
 	cases := map[string]struct {
 		classes []classifiedClusterQueue
@@ -164,22 +169,30 @@ func TestNoRealCandidate(t *testing.T) {
 		"no classes": {classes: nil, want: true},
 		"only never candidates": {
 			classes: []classifiedClusterQueue{
-				{cq: &schdcache.ClusterQueueSnapshot{Name: otherCQName}, sorted: []*workload.Info{fake}},
+				class(fake),
 			},
 			want: true,
 		},
 		"one real candidate": {
 			classes: []classifiedClusterQueue{
-				{cq: &schdcache.ClusterQueueSnapshot{Name: otherCQName}, sorted: []*workload.Info{fake, real1}},
+				class(fake, real1),
 			},
 			want: false,
 		},
 		"real candidate short-circuits across classes": {
 			classes: []classifiedClusterQueue{
-				{cq: &schdcache.ClusterQueueSnapshot{Name: otherCQName}, sorted: []*workload.Info{real2}},
-				{cq: &schdcache.ClusterQueueSnapshot{Name: otherCQName}, sorted: []*workload.Info{fake}},
+				class(real2),
+				class(fake),
 			},
 			want: false,
+		},
+		"real candidate removed from the Snapshot is ignored": {
+			classes: func() []classifiedClusterQueue {
+				cc := class(fake, real1)
+				delete(cc.cq.Workloads, workload.Key(real1.Obj))
+				return []classifiedClusterQueue{cc}
+			}(),
+			want: true,
 		},
 	}
 	for name, tc := range cases {
