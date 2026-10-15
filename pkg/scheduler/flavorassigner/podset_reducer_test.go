@@ -197,7 +197,7 @@ func TestOrderedReduce(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			red := NewOrderedPodSetReducer(tc.podSets, tc.ok)
+			red := NewOrderedPodSetReducer(tc.podSets, nil, tc.ok)
 			result, found := red.Reduce(false)
 			if found != tc.wantFound {
 				t.Errorf("Unexpected found:%v, want: %v", found, tc.wantFound)
@@ -283,7 +283,7 @@ func TestOrderedReduceOverAnAdmittedBaseline(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			red := NewOrderedPodSetReducer(tc.podSets, tc.ok)
+			red := NewOrderedPodSetReducer(tc.podSets, nil, tc.ok)
 			result, found := red.Reduce(true)
 			if found != tc.wantFound {
 				t.Errorf("Unexpected found:%v, want: %v", found, tc.wantFound)
@@ -308,7 +308,7 @@ func TestOrderedReduceMustGrowIsTheOnlyDifference(t *testing.T) {
 		return counts[0]+counts[1] <= 9
 	}
 
-	result, found := NewOrderedPodSetReducer(podSets, fits).Reduce(false)
+	result, found := NewOrderedPodSetReducer(podSets, nil, fits).Reduce(false)
 	if !found {
 		t.Fatal("Expected the baseline counts to be admitted when nothing is running at them")
 	}
@@ -316,7 +316,7 @@ func TestOrderedReduceMustGrowIsTheOnlyDifference(t *testing.T) {
 		t.Errorf("Unexpected counts (-want,+got):\n%s", diff)
 	}
 
-	if _, found := NewOrderedPodSetReducer(podSets, fits).Reduce(true); found {
+	if _, found := NewOrderedPodSetReducer(podSets, nil, fits).Reduce(true); found {
 		t.Error("Expected the same counts to be rejected when the job is already running at them")
 	}
 }
@@ -333,7 +333,7 @@ func TestReduceTotalDeltaLarge(t *testing.T) {
 		return total <= 1
 	}
 
-	red := NewOrderedPodSetReducer(podSets, fits)
+	red := NewOrderedPodSetReducer(podSets, nil, fits)
 
 	if want, got := int64(4_294_967_295), red.totalDelta; got != want {
 		t.Fatalf("Unexpected totalDelta: %d, want %d", got, want)
@@ -385,7 +385,7 @@ func TestGiveBack(t *testing.T) {
 				probes++
 				return true
 			}
-			psr := NewOrderedPodSetReducer(podSets, fits)
+			psr := NewOrderedPodSetReducer(podSets, nil, fits)
 
 			counts := slices.Clone(tc.counts)
 			result, found := psr.giveBack(counts, false)

@@ -48,6 +48,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/workload"
 	"sigs.k8s.io/kueue/pkg/workload/concurrentadmission"
 	workloadfinish "sigs.k8s.io/kueue/pkg/workload/finish"
+	"sigs.k8s.io/kueue/pkg/workloadresize"
 )
 
 var (
@@ -795,7 +796,10 @@ func (m *Manager) requeueWorkloadLocked(ctx context.Context, info *workload.Info
 		return false, nil
 	}
 	// An inadmissible workload may still have a pending second-pass request.
-	if !workload.IsAdmissible(&w) {
+	// A resize scale-up workload already holds a quota reservation, so IsAdmissible
+	// returns false for it; let it requeue anyway so the scheduler can grant the
+	// delta quota for the increased count.
+	if !workload.IsAdmissible(&w) && !workloadresize.IsScaleUp(&w) {
 		return false, nil
 	}
 

@@ -45,7 +45,7 @@ type PodSetReducer struct {
 	distribute distributeFunc
 }
 
-func newPodSetReducer(podSets []kueue.PodSet, fits func([]int32) bool, distribute distributeFunc) *PodSetReducer {
+func newPodSetReducer(podSets []kueue.PodSet, lowerBounds []int32, fits func([]int32) bool, distribute distributeFunc) *PodSetReducer {
 	psr := &PodSetReducer{
 		podSets:    podSets,
 		deltas:     make([]int32, len(podSets)),
@@ -58,7 +58,14 @@ func newPodSetReducer(podSets []kueue.PodSet, fits func([]int32) bool, distribut
 		ps := &psr.podSets[i]
 		psr.fullCounts[i] = ps.Count
 
-		d := ps.Count - ptr.Deref(ps.MinCount, ps.Count)
+		floor := ptr.Deref(ps.MinCount, ps.Count)
+		if lowerBounds != nil {
+			floor = max(floor, lowerBounds[i])
+		}
+		if floor > ps.Count {
+			floor = ps.Count
+		}
+		d := ps.Count - floor
 		psr.deltas[i] = d
 		psr.totalDelta += int64(d)
 	}
@@ -70,8 +77,11 @@ func newPodSetReducer(podSets []kueue.PodSet, fits func([]int32) bool, distribut
 // needlessly. The budget is a single number, but PodSets tied to different node groups draw
 // on separate capacity, so spending from the back can drain a PodSet whose own capacity was
 // never the constraint.
-func NewOrderedPodSetReducer(podSets []kueue.PodSet, fits func([]int32) bool) *PodSetReducer {
-	return newPodSetReducer(podSets, fits, distributeOrderBased)
+//
+// lowerBounds, when non-nil, raises each PodSet's floor to max(MinCount, lowerBounds[i]).
+// Pass nil for normal partial-admission behaviour.
+func NewOrderedPodSetReducer(podSets []kueue.PodSet, lowerBounds []int32, fits func([]int32) bool) *PodSetReducer {
+	return newPodSetReducer(podSets, lowerBounds, fits, distributeOrderBased)
 }
 
 func distributeOrderBased(out, fullCounts, deltas []int32, amount, _ int64) {

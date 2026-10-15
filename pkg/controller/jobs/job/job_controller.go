@@ -382,6 +382,8 @@ func (j *Job) RunWithPodSetsInfo(ctx context.Context, _ client.Client, podSetsIn
 
 	info := podSetsInfo[0]
 
+	// For partial-admission jobs (JobMinParallelismAnnotation), apply the admitted count to
+	// spec.parallelism so the running Job reflects what Kueue actually admitted.
 	if j.minPodsCount() != nil {
 		j.Spec.Parallelism = new(info.Count)
 		if j.syncCompletionWithParallelism() {
@@ -397,8 +399,11 @@ func (j *Job) RestorePodSetsInfo(_ context.Context, podSetsInfo []podset.PodSetI
 	}
 
 	changed := false
-	// if the job accepts partial admission
-	if j.minPodsCount() != nil && ptr.Deref(j.Spec.Parallelism, 0) != podSetsInfo[0].Count {
+	// For partial-admission jobs (JobMinParallelismAnnotation), restore spec.parallelism to the
+	// value recorded in the workload's podSetAssignments so the Job reflects the actual admitted
+	// scale after a preemption or re-queue.
+	if j.minPodsCount() != nil &&
+		ptr.Deref(j.Spec.Parallelism, 0) != podSetsInfo[0].Count {
 		changed = true
 		j.Spec.Parallelism = new(podSetsInfo[0].Count)
 		if j.syncCompletionWithParallelism() {
