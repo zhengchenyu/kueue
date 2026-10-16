@@ -58,6 +58,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/util/podset"
 	"sigs.k8s.io/kueue/pkg/util/priority"
 	utilptr "sigs.k8s.io/kueue/pkg/util/ptr"
+	"sigs.k8s.io/kueue/pkg/workloadresize"
 	"sigs.k8s.io/kueue/pkg/util/queue"
 	utilresource "sigs.k8s.io/kueue/pkg/util/resource"
 	"sigs.k8s.io/kueue/pkg/util/resourcegroups"
@@ -1791,21 +1792,27 @@ func IsElasticWorkload(wl *kueue.Workload) bool {
 }
 
 // MinCountsUsable reports whether PodSet.MinCount is honored for the given Workload, i.e. whether
-// the workload may be partially admitted. MinCount is populated by two independent mechanisms, each
-// with its own feature gate: PartialAdmission (classic, e.g. batch/Job's job-min-parallelism) and
-// ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp (elastic partial scale-up).
+// the workload may be partially admitted. MinCount is populated by three independent mechanisms,
+// each with its own feature gate: PartialAdmission (classic, e.g. batch/Job's job-min-parallelism),
+// ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp (elastic partial scale-up via workloadslicing),
+// and ElasticJobsViaWorkloadResizeWithPartialReplicaScaleUp (elastic partial scale-up via workloadresize).
 //
 // Both the scheduler and the job reconciler must agree on this predicate: the reconciler clears
 // MinCounts it reports as unusable, so a looser check in the scheduler would admit on values the
 // reconciler already erased.
 //
-// The elastic branch cannot narrow further to workloads that actually opted into the "partial"
-// scale-up strategy, because the elastic-job-scale-up-strategy annotation is set on the Job and is
-// not propagated to the Workload. Opting in is instead enforced where MinCount is produced, so an
-// "atomic" workload reaches the scheduler with no MinCount to act on.
+// The elastic-slicing branch cannot narrow further to workloads that actually opted into the
+// "partial" scale-up strategy, because the elastic-job-scale-up-strategy annotation is set on the
+// Job and is not propagated to the Workload. Opting in is instead enforced where MinCount is
+// produced, so an "atomic" workload reaches the scheduler with no MinCount to act on.
+//
+// The workloadresize branch does not need a per-job strategy annotation: MinCount is set
+// explicitly by the user (e.g. via job-min-parallelism for batch/Job) and its presence already
+// expresses the intent to allow partial admission.
 func MinCountsUsable(wl *kueue.Workload) bool {
 	return features.Enabled(features.PartialAdmission) ||
-		(features.Enabled(features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp) && IsElasticWorkload(wl))
+		(features.Enabled(features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp) && IsElasticWorkload(wl)) ||
+		(features.Enabled(features.ElasticJobsViaWorkloadResizeWithPartialReplicaScaleUp) && workloadresize.Enabled(wl))
 }
 
 // UnadmittedWorkloadReasonWithFallback returns the granularReason if the UnadmittedWorkloadsObservability

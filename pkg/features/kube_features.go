@@ -196,6 +196,17 @@ const (
 	// status.admission (supporting partial admission), and releases quota on scale-down.
 	ElasticJobsViaWorkloadResize featuregate.Feature = "ElasticJobsViaWorkloadResize"
 
+	// owner: @zhengchenyu
+	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/77-dynamically-sized-jobs
+	//
+	// ElasticJobsViaWorkloadResizeWithPartialReplicaScaleUp enables partial admission during
+	// scale-up for workloads managed by ElasticJobsViaWorkloadResize. When this gate is on and
+	// the workload has a MinCount set (e.g. via job-min-parallelism for batch/Job), the scheduler
+	// may admit at a count between MinCount and the requested Count if full quota is unavailable.
+	// When this gate is off, scale-up is all-or-nothing: the workload stays pending until the
+	// full requested count fits.
+	ElasticJobsViaWorkloadResizeWithPartialReplicaScaleUp featuregate.Feature = "ElasticJobsViaWorkloadResizeWithPartialReplicaScaleUp"
+
 	// owner: @pbundyra
 	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/2724-topology-aware-scheduling
 	//
@@ -1027,6 +1038,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
 		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
 	},
 	ElasticJobsViaWorkloadResize: {
+		{Version: version.MustParse("0.21"), Default: false, PreRelease: featuregate.Alpha},
+	},
+	ElasticJobsViaWorkloadResizeWithPartialReplicaScaleUp: {
 		{Version: version.MustParse("0.21"), Default: false, PreRelease: featuregate.Alpha},
 	},
 	TASFailedNodeReplacementFailFast: {
