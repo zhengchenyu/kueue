@@ -104,6 +104,6 @@ func managerAndSchedulerSetup(ctx context.Context, mgr manager.Manager) {
 		scheduler.WithPartialPreemptionTimeout(partialPreemptionTimeout),
 		scheduler.WithOnDemandPreemption(true),
 	)
-	err = sched.Start(ctx)
+	err = mgr.Add(sched)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 }

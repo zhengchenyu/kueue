@@ -341,6 +341,12 @@ type PartialPreemption struct {
 	// "kueue.x-k8s.io/partial-preemption-max-reclaimed-count" annotation or minCount.
 	// +optional
 	EnableOnDemandPreemption bool `json:"enableOnDemandPreemption,omitempty"`
+
+	// EnableStrictPriorityPreemption makes classical preemption fully preempt the
+	// candidates at the current priority before crossing into a higher-priority one.
+	// Defaults to false.
+	// +optional
+	EnableStrictPriorityPreemption bool `json:"enableStrictPriorityPreemption,omitempty"`
 }
 
 // WaitForPodsReady defines configuration for the Wait For Pods Ready feature,

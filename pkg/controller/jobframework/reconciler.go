@@ -672,18 +672,6 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
-	// 9. handle partial preemption.
-	// If the workload has a pending ReclaimTargetCount, the scheduler asked the job to
-	// scale down to that target count. Drive the scale-down by asking the job runtime to
-	// reduce its replicas toward the target.
-	if ppJob, ok := job.(JobWithPartialPreemption); ok && workload.HasPendingReclaimTargetCount(wl) {
-		log.V(3).Info("Handling partial preemption scale-down")
-		if err := ppJob.RespondToPartialPreemption(ctx, r.client, wl); err != nil {
-			log.Error(err, "Responding to partial preemption")
-			return ctrl.Result{}, err
-		}
-	}
-
 	// Workload is admitted and job is running, nothing to do. For elastic jobs,
 	// pod ungating is handled by the ElasticJobUngater controller.
 	log.V(3).Info("Job running with admitted workload, nothing to do")
@@ -1776,7 +1764,7 @@ func EquivalentToWorkload(ctx context.Context, c client.Client, job GenericJob, 
 	if workload.IsAdmitted(wl) {
 		opts = append(opts, equality.WithIgnoreTolerations())
 	}
-	if workload.HasPendingReclaimTargetCount(wl) {
+	if workload.HasPendingPreemptionTargetCount(wl) {
 		opts = append(opts, equality.WithIgnoreCount())
 	}
 	if !features.Enabled(features.TopologyAwareScheduling) {

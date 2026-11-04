@@ -1648,6 +1648,13 @@ kind: Configuration
 partialPreemption:
   timeout: 1m
 `)
+	strictPriorityConfig := writeConfig("partial-preemption-strict-priority.yaml", `
+apiVersion: config.kueue.x-k8s.io/v1beta2
+kind: Configuration
+partialPreemption:
+  timeout: 30s
+  enableStrictPriorityPreemption: true
+`)
 
 	testCases := map[string]struct {
 		configFile string
@@ -1669,6 +1676,13 @@ partialPreemption:
 			want: &configapi.PartialPreemption{
 				Timeout:                  &metav1.Duration{Duration: time.Minute},
 				EnableOnDemandPreemption: false,
+			},
+		},
+		"strict-priority with timeout round-trips both fields": {
+			configFile: strictPriorityConfig,
+			want: &configapi.PartialPreemption{
+				Timeout:                        &metav1.Duration{Duration: 30 * time.Second},
+				EnableStrictPriorityPreemption: true,
 			},
 		},
 	}

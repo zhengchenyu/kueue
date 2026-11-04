@@ -124,7 +124,7 @@ func (r *Manager) EnsureWorkloadSlices(
 		// Scale-up on an admitted workload. A pending partial-preemption reclaim target means a
 		// preemptor already asked this workload to scale down; keep the current slice until the
 		// reclaim completes instead of creating a larger one.
-		if workload.HasPendingReclaimTargetCount(wl) {
+		if workload.HasPendingPreemptionTargetCount(wl) {
 			klog.FromContext(ctx).V(3).Info("Deferring workload slice scale-up while a partial-preemption reclaim target is still pending", "workload", klog.KObj(wl))
 			return wl, true, nil
 		}
@@ -162,7 +162,7 @@ func (r *Manager) EnsureWorkloadSlices(
 		// Scale-up on an admitted workload. A pending partial-preemption reclaim target means a
 		// preemptor already asked this workload to scale down; keep the current slice until the
 		// reclaim completes instead of creating a larger one.
-		if workload.HasPendingReclaimTargetCount(selectedWorkload) {
+		if workload.HasPendingPreemptionTargetCount(selectedWorkload) {
 			klog.FromContext(ctx).V(3).Info("Deferring workload slice scale-up while a partial-preemption reclaim target is still pending", "workload", klog.KObj(selectedWorkload))
 			return selectedWorkload, true, nil
 		}

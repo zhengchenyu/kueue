@@ -29,6 +29,7 @@ import (
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/resources"
+	"sigs.k8s.io/kueue/pkg/util/priority"
 	"sigs.k8s.io/kueue/pkg/workload"
 	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
 )
@@ -43,9 +44,33 @@ type CandidateIterator interface {
 	Next(borrow bool) (*workload.Info, string)
 }
 
+const (
+	// numSegments is the fixed slot count shared by both iterator implementations:
+	// an evicted half and a non-evicted half, each split into the three candidate
+	// sources hierarchy/priority/same-queue.
+	numSegments = 6
+	// numEvictedGroups is the evicted half, i.e. the leading single-pass slots.
+	numEvictedGroups = numSegments / 2
+)
+
 type candidateIterator struct {
-	candidates                        []*candidateElem
-	runIndex                          int
+	// segments is a fixed 6-slot layout: slots 0-2 hold the evicted candidates of
+	// hierarchy/priority/same-queue, slots 3-5 their non-evicted candidates. Slots
+	// may be nil. Next returns candidates slot by slot.
+	segments     [numSegments][]*candidateElem
+	segmentIndex int
+	// singleRoundGroups is how many leading slots are walked with a single pass. The
+	// rest are walked multi-round.
+	singleRoundGroups int
+	// cursor is the index into the current slot. bandStart is the index of the first
+	// candidate returned in the current round, or -1 before one is returned.
+	cursor    int
+	bandStart int
+	// strictPriority groups each multi-round slot by priority so lower-priority
+	// candidates are returned before higher-priority ones. Off means one group.
+	strictPriority bool
+	// roundHasRemainingCandidate records that the current round returned a partial
+	// candidate, so another round runs to shed it further.
 	roundHasRemainingCandidate        bool
 	frsNeedPreemption                 sets.Set[resources.FlavorResource]
 	snapshot                          *schdcache.Snapshot
@@ -82,12 +107,52 @@ func WorkloadUsesResources(wl *workload.Info, frsNeedPreemption sets.Set[resourc
 	return false
 }
 
-// assume a prefix of the elements has condition WorkloadEvicted = true
-func splitEvicted(workloads []*candidateElem) ([]*candidateElem, []*candidateElem) {
-	firstFalse := sort.Search(len(workloads), func(i int) bool {
+// splitEvicted splits one sorted candidate slice into the two groups the 6-slot
+// layout needs. Candidates arrive sorted by CandidatesOrdering, which puts the
+// evicted ones first; a pending preemption target is NOT a sort key, so such
+// candidates sit at their natural priority position among the non-evicted ones:
+//
+//	[ evicted | normal, by priority (pending-reclaim interleaved) ]
+//
+// nonEvicted is the whole non-evicted part, left in that natural order. evicted is
+// the evicted prefix PLUS every pending-reclaim candidate, picked out of the
+// non-evicted part by a linear scan. So a pending-reclaim candidate is placed in
+// BOTH groups on purpose - it is the one candidate that lives at both ends of the
+// layout:
+//   - evicted feeds the single-pass slots (walked once, ahead of everything else),
+//     which forces a victim that already has a reclaim target to be revisited first so
+//     its existing target is reused instead of a fresh victim being chosen.
+//   - nonEvicted feeds the multi-round slots, so after that first reuse the same victim
+//     keeps taking part in the ordinary shedding loop for whatever is still owed below
+//     the pending target - at its natural priority position, not ahead of lower-priority
+//     victims.
+//
+// A pending candidate therefore appears in both groups by pointer; candidateElem is
+// never mutated, so no copy is needed. Because the pending candidates are no longer
+// contiguous with the evicted prefix, evicted is a freshly allocated slice rather
+// than a reslice.
+func splitEvicted(workloads []*candidateElem) (evicted, nonEvicted []*candidateElem) {
+	firstNonEvicted := sort.Search(len(workloads), func(i int) bool {
 		return !workloadevict.IsEvicted(workloads[i].wl.Obj)
 	})
-	return workloads[:firstFalse], workloads[firstFalse:]
+	nonEvicted = workloads[firstNonEvicted:]
+	evicted = workloads[:firstNonEvicted:firstNonEvicted]
+	for _, c := range nonEvicted {
+		if c.wl.HasPendingPreemptionTarget {
+			evicted = append(evicted, c)
+		}
+	}
+	return evicted, nonEvicted
+}
+
+// buildSegments lays each sorted group into the fixed 6-slot layout: slots 0-2 are
+// the evicted candidates of hierarchy/priority/same-queue, slots 3-5 their
+// non-evicted candidates. A slot is empty when its group is absent.
+func buildSegments(hierarchy, priority, sameQueue []*candidateElem) [numSegments][]*candidateElem {
+	evictedH, nonEvictedH := splitEvicted(hierarchy)
+	evictedP, nonEvictedP := splitEvicted(priority)
+	evictedS, nonEvictedS := splitEvicted(sameQueue)
+	return [numSegments][]*candidateElem{evictedH, evictedP, evictedS, nonEvictedH, nonEvictedP, nonEvictedS}
 }
 
 // NewCandidateIterator creates a new iterator that yields candidate workloads for preemption
@@ -102,11 +167,12 @@ func NewCandidateIterator(
 	snapshot *schdcache.Snapshot,
 	clock clock.Clock,
 	ordering func(logr.Logger, bool, *workload.Info, *workload.Info, kueue.ClusterQueueReference, time.Time) int,
+	strictPriority bool,
 ) CandidateIterator {
 	if features.Enabled(features.ClassicalPreemptionCandidateOrderCache) {
-		return newCacheCandidateIterator(hierarchicalReclaimCtx, enabledAfs, frsNeedPreemption, snapshot, clock, ordering)
+		return newCacheCandidateIterator(hierarchicalReclaimCtx, enabledAfs, frsNeedPreemption, snapshot, clock, ordering, strictPriority)
 	}
-	return newCandidateIterator(hierarchicalReclaimCtx, enabledAfs, frsNeedPreemption, snapshot, clock, ordering)
+	return newCandidateIterator(hierarchicalReclaimCtx, enabledAfs, frsNeedPreemption, snapshot, clock, ordering, strictPriority)
 }
 
 func newCandidateIterator(
@@ -116,6 +182,7 @@ func newCandidateIterator(
 	snapshot *schdcache.Snapshot,
 	clock clock.Clock,
 	ordering func(logr.Logger, bool, *workload.Info, *workload.Info, kueue.ClusterQueueReference, time.Time) int,
+	strictPriority bool,
 ) *candidateIterator {
 	sameQueueCandidates := collectSameQueueCandidates(hierarchicalReclaimCtx)
 	hierarchyCandidates, priorityCandidates := collectCandidatesForHierarchicalReclaim(hierarchicalReclaimCtx)
@@ -128,60 +195,110 @@ func newCandidateIterator(
 	slices.SortFunc(hierarchyCandidates, func(a, b *candidateElem) int {
 		return ordering(hierarchicalReclaimCtx.Log, enabledAfs, a.wl, b.wl, hierarchicalReclaimCtx.Cq.Name, clock.Now())
 	})
+	segments := buildSegments(hierarchyCandidates, priorityCandidates, sameQueueCandidates)
+	noCandidateFromOtherQueues := len(hierarchyCandidates) == 0 && len(priorityCandidates) == 0
 
-	evictedHierarchicalReclaimCandidates, nonEvictedHierarchicalReclaimCandidates := splitEvicted(hierarchyCandidates)
-	evictedSTCandidates, nonEvictedSTCandidates := splitEvicted(priorityCandidates)
-	evictedSameQueueCandidates, nonEvictedSameQueueCandidates := splitEvicted(sameQueueCandidates)
-	allCandidates := make([]*candidateElem, 0, len(hierarchyCandidates)+len(priorityCandidates)+len(sameQueueCandidates))
-	allCandidates = append(allCandidates, evictedHierarchicalReclaimCandidates...)
-	allCandidates = append(allCandidates, evictedSTCandidates...)
-	allCandidates = append(allCandidates, evictedSameQueueCandidates...)
-	allCandidates = append(allCandidates, nonEvictedHierarchicalReclaimCandidates...)
-	allCandidates = append(allCandidates, nonEvictedSTCandidates...)
-	allCandidates = append(allCandidates, nonEvictedSameQueueCandidates...)
+	// The leading numEvictedGroups slots (the evicted half) are always walked with a
+	// single pass. With partial preemption on, the remaining slots (the non-evicted
+	// half) need multiple rounds so a partial victim can be shed further across rounds;
+	// with it off every slot is single-pass, degenerating to the original whole-job
+	// forward scan.
+	singleRoundGroups := numEvictedGroups
+	if !features.Enabled(features.PartialPreemption) {
+		singleRoundGroups = len(segments)
+	}
+
 	return &candidateIterator{
-		runIndex:                          0,
+		segments:                          segments,
+		singleRoundGroups:                 singleRoundGroups,
+		bandStart:                         -1,
+		strictPriority:                    strictPriority,
 		frsNeedPreemption:                 frsNeedPreemption,
 		snapshot:                          snapshot,
-		candidates:                        allCandidates,
-		noCandidateFromOtherQueues:        len(hierarchyCandidates) == 0 && len(priorityCandidates) == 0,
+		noCandidateFromOtherQueues:        noCandidateFromOtherQueues,
 		noCandidateForHierarchicalReclaim: len(hierarchyCandidates) == 0,
 		hierarchicalReclaimCtx:            hierarchicalReclaimCtx,
 	}
 }
 
-// Next allows to iterate over the ordered sequence of candidates, with the reason
-// for eviction returned together with a candidate.
+// inCurrentBand reports whether seg[i] has the same priority as the first
+// candidate returned in the current round. It returns true before that first
+// candidate (bandStart < 0), which is always the case when strict priority is off.
+func (c *candidateIterator) inCurrentBand(seg []*candidateElem, i int) bool {
+	if c.bandStart < 0 {
+		return true
+	}
+	return priority.Priority(seg[i].wl.Obj) == priority.Priority(seg[c.bandStart].wl.Obj)
+}
+
+// Next returns the next candidate, walking the slots in order. When a slot is
+// exhausted it advances to the next one and resets the per-slot state.
 func (c *candidateIterator) Next(borrow bool) (*workload.Info, string) {
-	round := 0
+	for c.segmentIndex < len(c.segments) {
+		seg := c.segments[c.segmentIndex]
+		var current *workload.Info
+		var reason string
+		var ok bool
+		if c.segmentIndex < c.singleRoundGroups {
+			current, reason, ok = c.nextSingleRound(seg, borrow)
+		} else {
+			current, reason, ok = c.nextMultiRound(seg, borrow)
+		}
+		if ok {
+			return current, reason
+		}
+		c.segmentIndex++
+		c.cursor = 0
+		c.bandStart = -1
+		c.roundHasRemainingCandidate = false
+	}
+	return nil, ""
+}
+
+// nextSingleRound walks seg forward once, returning the next valid candidate, or
+// ok=false when the slot is exhausted.
+func (c *candidateIterator) nextSingleRound(seg []*candidateElem, borrow bool) (*workload.Info, string, bool) {
+	for c.cursor < len(seg) {
+		candidate := seg[c.cursor]
+		c.cursor++
+		current := c.currentWorkload(candidate)
+		if current == nil || !c.candidateIsValid(current, candidate, borrow) {
+			continue
+		}
+		return current, candidate.preemptionVariant.PreemptionReason(), true
+	}
+	return nil, "", false
+}
+
+// nextMultiRound returns the next candidate from a multi-round slot, or ok=false
+// when the slot is drained. A round walks from the top of the slot until it leaves
+// the current priority band. If the round returned a partial candidate, it runs
+// another round from the top; otherwise the slot is drained.
+func (c *candidateIterator) nextMultiRound(seg []*candidateElem, borrow bool) (*workload.Info, string, bool) {
 	for {
-		for c.runIndex < len(c.candidates) {
-			candidate := c.candidates[c.runIndex]
-			c.runIndex++
+		for c.cursor < len(seg) {
+			if !c.inCurrentBand(seg, c.cursor) {
+				break
+			}
+			candidate := seg[c.cursor]
+			c.cursor++
 			current := c.currentWorkload(candidate)
-			if current == nil {
+			if current == nil || !c.candidateIsValid(current, candidate, borrow) {
 				continue
 			}
-			if !c.candidateIsValid(current, candidate, borrow) {
-				continue
+			if c.strictPriority && c.bandStart < 0 {
+				c.bandStart = c.cursor - 1
 			}
-			// A workload with an existing reclaim target can be returned for pending-target
-			// handling, but it must not keep the iterator scanning rounds because handling it
-			// does not produce further preemption progress.
-			if current.HasPendingReclaimTarget {
-				if round > 0 {
-					continue
-				}
-			} else if current.IsPartialPreemptionJob {
+			if current.IsPartialPreemptionJob {
 				c.roundHasRemainingCandidate = true
 			}
-			return current, candidate.preemptionVariant.PreemptionReason()
+			return current, candidate.preemptionVariant.PreemptionReason(), true
 		}
-		round++
 		if !c.roundHasRemainingCandidate {
-			return nil, ""
+			return nil, "", false
 		}
-		c.runIndex = 0
+		c.cursor = 0
+		c.bandStart = -1
 		c.roundHasRemainingCandidate = false
 	}
 }
@@ -212,9 +329,13 @@ func (c *candidateIterator) candidateIsValid(wl *workload.Info, candidate *candi
 	return true
 }
 
-// Reset moves the candidate iterator back to the starting position.
+// Reset moves the candidate iterator back to the starting position so the next run
+// (borrow / non-borrow) walks the same segments from the top. Segments carry no
+// per-run state, so only the cursors and the round flag need clearing.
 func (c *candidateIterator) Reset() {
-	c.runIndex = 0
+	c.segmentIndex = 0
+	c.cursor = 0
+	c.bandStart = -1
 	c.roundHasRemainingCandidate = false
 }
 

@@ -80,7 +80,7 @@ var _ = ginkgo.Describe("Partial preemption timeout", func() {
 			Annotation(constants.PartialPreemptionAnnotation, "true").
 			Priority(0).
 			Queue(kueue.LocalQueueName(lq.Name)).
-			PodSets(*utiltestingapi.MakePodSet("main", 10).SetMinimumCount(5).Request(corev1.ResourceCPU, "1").Obj()).
+			PodSets(*utiltestingapi.MakePodSet("main", 10).SetPreemptionMinimumCount(5).Request(corev1.ResourceCPU, "1").Obj()).
 			Obj()
 		preemptor := utiltestingapi.MakeWorkload("preemptor", ns.Name).
 			Priority(10).
@@ -95,10 +95,10 @@ var _ = ginkgo.Describe("Partial preemption timeout", func() {
 
 		ginkgo.By("Creating the preemptor and waiting for the initial partial preemption request")
 		behavioral.MustCreate(ctx, k8sClient, preemptor)
-		expectReclaimTargetCount(victim, ptr.To[int32](6))
+		expectPreemptionTargetCount(victim, ptr.To[int32](6))
 		expectPreemptedCondition(victim, metav1.ConditionTrue)
 
-		ginkgo.By("Keeping the victim above reclaimTargetCount until the timeout elapses")
+		ginkgo.By("Keeping the victim above preemptionTargetCount until the timeout elapses")
 		time.Sleep(2 * partialPreemptionTimeout)
 
 		ginkgo.By("The next scheduling cycle falls back to whole preemption")
@@ -118,14 +118,14 @@ func expectCQUsage(cq *kueue.ClusterQueue, want string) {
 	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 }
 
-func expectReclaimTargetCount(wl *kueue.Workload, want *int32) {
+func expectPreemptionTargetCount(wl *kueue.Workload, want *int32) {
 	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
 		got := &kueue.Workload{}
 		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), got)).Should(gomega.Succeed())
 		g.Expect(workload.IsAdmitted(got)).Should(gomega.BeTrue())
 		g.Expect(got.Status.Admission).ShouldNot(gomega.BeNil())
 		g.Expect(got.Status.Admission.PodSetAssignments).Should(gomega.HaveLen(1))
-		g.Expect(got.Status.Admission.PodSetAssignments[0].ReclaimTargetCount).Should(gomega.Equal(want))
+		g.Expect(got.Status.Admission.PodSetAssignments[0].PreemptionTargetCount).Should(gomega.Equal(want))
 	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 }
 

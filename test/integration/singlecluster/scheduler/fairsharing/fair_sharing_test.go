@@ -546,7 +546,7 @@ var _ = ginkgo.Describe("Scheduler", ginkgo.Label("feature:fairsharing"), func()
 			}).Obj())
 		})
 
-		ginkgo.It("should partially preempt across a cohort and clear reclaimTargetCount on scale-down", framework.SlowSpec, func() {
+		ginkgo.It("should partially preempt across a cohort and clear preemptionTargetCount on scale-down", framework.SlowSpec, func() {
 			ginkgo.By("Admitting an elastic victim in cq-b at count 5 that borrows quota from the cohort")
 			victim := utiltestingapi.MakeWorkload("victim", ns.Name).
 				Annotation(constants.ElasticJobAnnotation, "true").
@@ -570,7 +570,7 @@ var _ = ginkgo.Describe("Scheduler", ginkgo.Label("feature:fairsharing"), func()
 			behavioral.MustCreate(ctx, k8sClient, preemptor)
 
 			ginkgo.By("Fair sharing requests a partial reclaim rather than a full eviction")
-			expectReclaimTargetCount(victim, ptr.To[int32](2))
+			expectPreemptionTargetCount(victim, ptr.To[int32](2))
 			expectPreemptedCondition(victim, metav1.ConditionTrue)
 
 			ginkgo.By("The victim keeps its reservation and the preemptor stays pending while the reclaim is pending")
@@ -584,7 +584,7 @@ var _ = ginkgo.Describe("Scheduler", ginkgo.Label("feature:fairsharing"), func()
 
 			// Lowering spec.count drops the victim's effective usage to min(spec,
 			// admission), freeing quota for the preemptor. Clearing the now-satisfied
-			// reclaimTargetCount is the workloadslicing Manager's job (driven by the
+			// preemptionTargetCount is the workloadslicing Manager's job (driven by the
 			// job controller), which this scheduler-only suite does not wire up, so we
 			// assert on quota being freed rather than on the target being cleared.
 			ginkgo.By("Scaling the victim down to the reclaim target frees quota and admits the preemptor")
@@ -627,7 +627,7 @@ var _ = ginkgo.Describe("Scheduler", ginkgo.Label("feature:fairsharing"), func()
 			behavioral.MustCreate(ctx, k8sClient, preemptor)
 
 			ginkgo.By("The victim is asked to partially reclaim rather than being fully evicted")
-			expectReclaimTargetCount(victim, ptr.To[int32](1))
+			expectPreemptionTargetCount(victim, ptr.To[int32](1))
 			expectPreemptedCondition(victim, metav1.ConditionTrue)
 			gomega.Consistently(func(g gomega.Gomega) {
 				got := &kueue.Workload{}
@@ -638,7 +638,7 @@ var _ = ginkgo.Describe("Scheduler", ginkgo.Label("feature:fairsharing"), func()
 			behavioral.ExpectWorkloadsToBePending(ctx, k8sClient, preemptor)
 
 			// See the note in the previous spec: the scheduler-only suite does not run
-			// the workloadslicing Manager that clears a satisfied reclaimTargetCount, so
+			// the workloadslicing Manager that clears a satisfied preemptionTargetCount, so
 			// we assert on freed quota rather than on the target being cleared.
 			ginkgo.By("Scaling the victim down to the reclaim target frees quota and admits the preemptor")
 			setResizeCount(victim, 1)
@@ -2270,14 +2270,14 @@ func expectCohortWeightedShare(cohortName string, weightedShare float64) {
 	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 }
 
-func expectReclaimTargetCount(wl *kueue.Workload, want *int32) {
+func expectPreemptionTargetCount(wl *kueue.Workload, want *int32) {
 	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
 		got := &kueue.Workload{}
 		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), got)).Should(gomega.Succeed())
 		g.Expect(workload.IsAdmitted(got)).Should(gomega.BeTrue())
 		g.Expect(got.Status.Admission).ShouldNot(gomega.BeNil())
 		g.Expect(got.Status.Admission.PodSetAssignments).Should(gomega.HaveLen(1))
-		g.Expect(got.Status.Admission.PodSetAssignments[0].ReclaimTargetCount).Should(gomega.Equal(want))
+		g.Expect(got.Status.Admission.PodSetAssignments[0].PreemptionTargetCount).Should(gomega.Equal(want))
 	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 }
 

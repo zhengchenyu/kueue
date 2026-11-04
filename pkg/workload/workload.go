@@ -233,9 +233,13 @@ type Info struct {
 	// per-call featureGate lookups and annotation map access.
 	IsPartialPreemptionJob bool
 
-	// HasPendingReclaimTarget indicates whether this workload has any admitted PodSet with
+	// HasPendingPreemptionTarget indicates whether this workload has any admitted PodSet with
 	// an in-flight partial-preemption reclaim target above its current count.
-	HasPendingReclaimTarget bool
+	HasPendingPreemptionTarget bool
+
+	// PartialPreemptionUsedCount caches the effective preemptible replica count for a
+	// partial-preemption job.
+	PartialPreemptionUsedCount int32
 
 	// PreemptionTargetSlot records this workload's index in the preemption targets slice within a
 	// single attempt (sentinel-0 encoded: 0 = unset). Owned by the preemption package.
@@ -367,7 +371,13 @@ func (i *Info) Update(log logr.Logger, wl *kueue.Workload, opts ...InfoOption) {
 		i.updateDerivedFields(log, options.skipSchedulingHash)
 	}
 	i.IsPartialPreemptionJob = IsPartialPreemptionJob(wl)
-	i.HasPendingReclaimTarget = HasPendingReclaimTargetCount(wl)
+	if i.IsPartialPreemptionJob {
+		i.HasPendingPreemptionTarget = HasPendingPreemptionTargetCount(wl)
+		i.PartialPreemptionUsedCount = PartialPreemptionUsedCount(wl)
+	} else {
+		i.HasPendingPreemptionTarget = false
+		i.PartialPreemptionUsedCount = 0
+	}
 }
 
 // schedulingHashInputs is what an Info's SchedulingHash was computed from,
@@ -1163,6 +1173,25 @@ func SetPreemptedCondition(w *kueue.Workload, now time.Time, reason string, mess
 		LastTransitionTime: metav1.NewTime(now),
 		Reason:             reason,
 		Message:            api.TruncateConditionMessage(message),
+	}
+	return apimeta.SetStatusCondition(&w.Status.Conditions, condition)
+}
+
+// SetPartiallyPreemptedCondition sets the PartiallyPreempted condition, reporting whether it
+// changed. True marks an in-flight partial-preemption target whose quota is still charged;
+// False marks the quota release (reason QuotaReleased) or the timeout (reason Timeout).
+func SetPartiallyPreemptedCondition(w *kueue.Workload, now time.Time, active bool, reason, message string) bool {
+	status := metav1.ConditionFalse
+	if active {
+		status = metav1.ConditionTrue
+	}
+	condition := metav1.Condition{
+		Type:               kueue.WorkloadPartiallyPreempted,
+		Status:             status,
+		LastTransitionTime: metav1.NewTime(now),
+		Reason:             reason,
+		Message:            api.TruncateConditionMessage(message),
+		ObservedGeneration: w.Generation,
 	}
 	return apimeta.SetStatusCondition(&w.Status.Conditions, condition)
 }

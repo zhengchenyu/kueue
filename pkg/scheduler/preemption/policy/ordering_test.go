@@ -164,20 +164,20 @@ func TestCandidatesOrderingPartialPreemptionGateDisabled(t *testing.T) {
 	}
 }
 
-// TestCandidatesOrderingPendingReclaimTarget checks the HasPendingReclaimTarget ordering
+// TestCandidatesOrderingPendingPreemptionTarget checks the HasPendingPreemptionTarget ordering
 // criterion: a workload with a pending reclaim target sorts before one without.
-func TestCandidatesOrderingPendingReclaimTarget(t *testing.T) {
+func TestCandidatesOrderingPendingPreemptionTarget(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	_, log := utiltesting.ContextWithLog(t)
 	// partialWl builds a partial-preemption workload admitted at count=5.
-	// reclaimTarget < 0 means no ReclaimTargetCount is set.
-	partialWl := func(name string, reserved time.Time, reclaimTarget int32) *workload.Info {
+	// preemptionTarget < 0 means no PreemptionTargetCount is set.
+	partialWl := func(name string, reserved time.Time, preemptionTarget int32) *workload.Info {
 		psa := utiltestingapi.MakePodSetAssignment("executor").
 			Assignment(corev1.ResourceCPU, "default", "5000m").
 			Count(5).
 			Obj()
-		if reclaimTarget >= 0 {
-			psa.ReclaimTargetCount = new(reclaimTarget)
+		if preemptionTarget >= 0 {
+			psa.PreemptionTargetCount = new(preemptionTarget)
 		}
 		wl := utiltestingapi.MakeWorkload(name, "ns").
 			UID(types.UID(name)).
@@ -200,10 +200,10 @@ func TestCandidatesOrderingPendingReclaimTarget(t *testing.T) {
 	const preemptorCQ = kueue.ClusterQueueReference("preemptor-cq")
 
 	// wlSpec describes one candidate. reservedDelta offsets its admission time from now (a larger
-	// delta means admitted more recently); reclaimTarget < 0 leaves ReclaimTargetCount unset.
+	// delta means admitted more recently); preemptionTarget < 0 leaves PreemptionTargetCount unset.
 	type wlSpec struct {
-		reservedDelta time.Duration
-		reclaimTarget int32
+		reservedDelta    time.Duration
+		preemptionTarget int32
 	}
 	cases := map[string]struct {
 		gateEnabled bool
@@ -212,41 +212,33 @@ func TestCandidatesOrderingPendingReclaimTarget(t *testing.T) {
 		// its negation (antisymmetry).
 		wantSign int
 	}{
-		"gate on: pending reclaim target sorts before a more recent no-target candidate": {
-			// a has no reclaim target and is admitted more recently; b has count=5 > target=3
-			// (HasPendingReclaimTarget=true), so b sorts first.
-			gateEnabled: true,
-			a:           wlSpec{reservedDelta: time.Minute, reclaimTarget: -1},
-			b:           wlSpec{reservedDelta: 0, reclaimTarget: 3},
-			wantSign:    1,
-		},
 		"gate on: satisfied reclaim target does not sort first, recency decides": {
 			// a has count=5 == target=5 (not pending); both not pending, so the newer a sorts first.
 			gateEnabled: true,
-			a:           wlSpec{reservedDelta: time.Minute, reclaimTarget: 5},
-			b:           wlSpec{reservedDelta: 0, reclaimTarget: -1},
+			a:           wlSpec{reservedDelta: time.Minute, preemptionTarget: 5},
+			b:           wlSpec{reservedDelta: 0, preemptionTarget: -1},
 			wantSign:    -1,
 		},
 		"gate on: recency decides when both have pending targets": {
 			// both pending; the newer b sorts first.
 			gateEnabled: true,
-			a:           wlSpec{reservedDelta: 0, reclaimTarget: 3},
-			b:           wlSpec{reservedDelta: time.Minute, reclaimTarget: 3},
+			a:           wlSpec{reservedDelta: 0, preemptionTarget: 3},
+			b:           wlSpec{reservedDelta: time.Minute, preemptionTarget: 3},
 			wantSign:    1,
 		},
-		"gate off: HasPendingReclaimTarget always false, recency decides": {
+		"gate off: HasPendingPreemptionTarget always false, recency decides": {
 			// gate off → neither is pending; the newer b sorts first.
 			gateEnabled: false,
-			a:           wlSpec{reservedDelta: 0, reclaimTarget: 3},
-			b:           wlSpec{reservedDelta: time.Minute, reclaimTarget: -1},
+			a:           wlSpec{reservedDelta: 0, preemptionTarget: 3},
+			b:           wlSpec{reservedDelta: time.Minute, preemptionTarget: -1},
 			wantSign:    1,
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			features.SetFeatureGateDuringTest(t, features.PartialPreemption, tc.gateEnabled)
-			a := partialWl("a", now.Add(tc.a.reservedDelta), tc.a.reclaimTarget)
-			b := partialWl("b", now.Add(tc.b.reservedDelta), tc.b.reclaimTarget)
+			a := partialWl("a", now.Add(tc.a.reservedDelta), tc.a.preemptionTarget)
+			b := partialWl("b", now.Add(tc.b.reservedDelta), tc.b.preemptionTarget)
 			if got := CandidatesOrdering(log, false, a, b, preemptorCQ, now); sign(got) != tc.wantSign {
 				t.Errorf("CandidatesOrdering(a, b) = %d (sign %d), want sign %d", got, sign(got), tc.wantSign)
 			}
@@ -254,5 +246,57 @@ func TestCandidatesOrderingPendingReclaimTarget(t *testing.T) {
 				t.Errorf("CandidatesOrdering(b, a) = %d (sign %d), want sign %d (antisymmetry)", got, sign(got), -tc.wantSign)
 			}
 		})
+	}
+}
+
+// TestCandidatesOrderingUsedCount locks the criterion-6 tie-break: among two partial-preemptible
+// candidates that are otherwise equal (same CQ, no pending target, same priority), the one able to
+// shed more replicas above its preemption floor (larger PartialPreemptionUsedCount) sorts first.
+func TestCandidatesOrderingUsedCount(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
+
+	_, log := utiltesting.ContextWithLog(t)
+	now := time.Now().Truncate(time.Second)
+	const cq kueue.ClusterQueueReference = "cq"
+
+	// partialWl builds a partial-preemption workload admitted at count=5 with the given preemption
+	// floor, so its cached PartialPreemptionUsedCount is 5-preemptionMinCount.
+	partialWl := func(name string, preemptionMinCount int32) *workload.Info {
+		wl := utiltestingapi.MakeWorkload(name, metav1.NamespaceDefault).
+			UID(types.UID(name)).
+			Queue("default").
+			Annotation(constants.PartialPreemptionAnnotation, "true").
+			Priority(100).
+			PodSets(*utiltestingapi.MakePodSet("executor", 5).
+				Request(corev1.ResourceCPU, "1").
+				SetPreemptionMinimumCount(preemptionMinCount).
+				Obj()).
+			ReserveQuotaAt(
+				utiltestingapi.MakeAdmission("cq").
+					PodSets(utiltestingapi.MakePodSetAssignment("executor").
+						Assignment(corev1.ResourceCPU, "default", "1").
+						Count(5).
+						Obj()).
+					Obj(),
+				now,
+			).
+			Obj()
+		info := workload.NewInfo(log, wl)
+		info.ClusterQueue = cq
+		return info
+	}
+
+	// a can shed 4 (5-1), b can shed 1 (5-4); a sorts first.
+	a := partialWl("a", 1)
+	b := partialWl("b", 4)
+
+	if a.PartialPreemptionUsedCount != 4 || b.PartialPreemptionUsedCount != 1 {
+		t.Fatalf("cached used counts = (%d, %d), want (4, 1)", a.PartialPreemptionUsedCount, b.PartialPreemptionUsedCount)
+	}
+	if got := CandidatesOrdering(log, false, a, b, cq, now); sign(got) != -1 {
+		t.Errorf("CandidatesOrdering(a, b) = %d (sign %d), want sign -1 (more sheddable first)", got, sign(got))
+	}
+	if got := CandidatesOrdering(log, false, b, a, cq, now); sign(got) != 1 {
+		t.Errorf("CandidatesOrdering(b, a) = %d (sign %d), want sign 1 (antisymmetry)", got, sign(got))
 	}
 }

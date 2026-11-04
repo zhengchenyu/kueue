@@ -266,7 +266,7 @@ func iterateWithFirstFsStrategy(
 			if !yield(plan.target) {
 				return
 			}
-			if plan.partial && !plan.pending {
+			if plan.partial {
 				candCQ.RequeueWorkload(candWl)
 			}
 			continue
@@ -280,7 +280,7 @@ func iterateWithFirstFsStrategy(
 			if !yield(plan.target) {
 				return
 			}
-			if plan.partial && !plan.pending {
+			if plan.partial {
 				candCQ.RequeueWorkload(candWl)
 			}
 			continue
@@ -316,7 +316,7 @@ func iterateWithFirstFsStrategy(
 					strategyLog.flush()
 					return
 				}
-				if plan.partial && !plan.pending {
+				if plan.partial {
 					candCQ.RequeueWorkload(candWl)
 				}
 				// Might need to pick a different CQ due to changing values.
@@ -361,7 +361,7 @@ func iterateWithSecondFsStrategy(
 			if !yield(plan.target) {
 				return false
 			}
-			if plan.partial && !plan.pending {
+			if plan.partial {
 				candCQ.RequeueWorkload(candWl)
 				continue
 			}

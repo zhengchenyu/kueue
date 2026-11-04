@@ -1764,7 +1764,7 @@ func TestFairPreemptions(t *testing.T) {
 			recorder := &utiltesting.EventRecorder{}
 			preemptor := New(cl, workload.Ordering{}, recorder, &config.FairSharing{
 				PreemptionStrategies: tc.strategies,
-			}, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil, 0, false)
+			}, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil, 0, false, false)
 
 			beforeSnapshot, err := cqCache.Snapshot(ctx)
 			if err != nil {
@@ -1910,7 +1910,7 @@ func TestFairPreemptionSkipsUnsatisfiableTournament(t *testing.T) {
 			}
 
 			preemptor := New(cl, workload.Ordering{}, &utiltesting.EventRecorder{}, &config.FairSharing{},
-				false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil, 0, false)
+				false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil, 0, false, false)
 			wlInfo := workload.NewInfo(setupLog, unitWl.Clone().Name("a_incoming").Obj())
 			wlInfo.ClusterQueue = "a"
 			strategies := preemptor.GetPreemptionStrategyIterator(ctx, *wlInfo, snapshot, singlePodSetAssignment(
@@ -1980,14 +1980,14 @@ func TestFairPreemptionsPartial(t *testing.T) {
 			Obj(),
 	)
 	// victim builds an opt-in elastic job in "b" whose executor PodSet is admitted at
-	// count=usedCount (usedCount CPU), minCount=1.
+	// count=usedCount (usedCount CPU), preemptionMinCount=1.
 	victim := func(usedCount int) *kueue.Workload {
 		return utiltestingapi.MakeWorkload("victim", "").
 			UID("victim").
 			Annotation(constants.PartialPreemptionAnnotation, "true").
 			PodSets(*utiltestingapi.MakePodSet("executor", usedCount).
 				Request(corev1.ResourceCPU, "1").
-				SetMinimumCount(1).
+				SetPreemptionMinimumCount(1).
 				Obj()).
 			ReserveQuotaAt(
 				utiltestingapi.MakeAdmission("b").
@@ -2002,8 +2002,8 @@ func TestFairPreemptionsPartial(t *testing.T) {
 	}
 
 	type wantTarget struct {
-		podSet             kueue.PodSetReference
-		reclaimTargetCount int32
+		podSet                kueue.PodSetReference
+		preemptionTargetCount int32
 	}
 	cases := map[string]struct {
 		clusterQueues []*kueue.ClusterQueue
@@ -2018,7 +2018,7 @@ func TestFairPreemptionsPartial(t *testing.T) {
 			clusterQueues: twoCQs,
 			victim:        victim(5),
 			incomingCPU:   "4",
-			want:          &wantTarget{podSet: "executor", reclaimTargetCount: 2},
+			want:          &wantTarget{podSet: "executor", preemptionTargetCount: 2},
 		},
 		"no targets when the preemptor cannot fit": {
 			clusterQueues: twoCQs,
@@ -2033,7 +2033,7 @@ func TestFairPreemptionsPartial(t *testing.T) {
 			strategies:    []config.PreemptionStrategy{config.LessThanOrEqualToFinalShare},
 			victim:        victim(7),
 			incomingCPU:   "4",
-			want:          &wantTarget{podSet: "executor", reclaimTargetCount: 6},
+			want:          &wantTarget{podSet: "executor", preemptionTargetCount: 6},
 		},
 	}
 	for name, tc := range cases {
@@ -2054,7 +2054,7 @@ func TestFairPreemptionsPartial(t *testing.T) {
 			}
 			preemptor := New(cl, workload.Ordering{}, &utiltesting.EventRecorder{}, &config.FairSharing{
 				PreemptionStrategies: tc.strategies,
-			}, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil, 0, true)
+			}, false, clocktesting.NewFakeClock(now), nil, preemptexpectations.New(), nil, 0, true, false)
 
 			beforeSnapshot, err := cqCache.Snapshot(ctx)
 			if err != nil {
@@ -2101,8 +2101,8 @@ func TestFairPreemptionsPartial(t *testing.T) {
 			if got := target.PartialPreemption.PodSet; got != tc.want.podSet {
 				t.Errorf("PartialPreemption.PodSet = %q, want %q", got, tc.want.podSet)
 			}
-			if got := target.PartialPreemption.ReclaimTargetCount; got != tc.want.reclaimTargetCount {
-				t.Errorf("PartialPreemption.ReclaimTargetCount = %d, want %d", got, tc.want.reclaimTargetCount)
+			if got := target.PartialPreemption.PreemptionTargetCount; got != tc.want.preemptionTargetCount {
+				t.Errorf("PartialPreemption.PreemptionTargetCount = %d, want %d", got, tc.want.preemptionTargetCount)
 			}
 			if diff := cmp.Diff(beforeSnapshot, snapshot, snapCmpOpts); diff != "" {
 				t.Errorf("Snapshot was modified (-initial,+end):\n%s", diff)

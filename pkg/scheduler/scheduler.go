@@ -108,6 +108,7 @@ type options struct {
 	admissionFairSharing                *config.AdmissionFairSharing
 	partialPreemptionTimeout            time.Duration
 	enableOnDemandPreemption            bool
+	enableStrictPriorityPreemption      bool
 	quotaCheckStrategy                  config.QuotaCheckStrategy
 	clock                               clock.Clock
 	roleTracker                         *roletracker.RoleTracker
@@ -154,6 +155,14 @@ func WithPartialPreemptionTimeout(timeout time.Duration) Option {
 func WithOnDemandPreemption(enabled bool) Option {
 	return func(o *options) {
 		o.enableOnDemandPreemption = enabled
+	}
+}
+
+// WithStrictPriorityPreemption makes classical preemption fully preempt the
+// candidates at the current priority before crossing into a higher-priority one.
+func WithStrictPriorityPreemption(enabled bool) Option {
+	return func(o *options) {
+		o.enableStrictPriorityPreemption = enabled
 	}
 }
 
@@ -250,6 +259,7 @@ func New(queues *qcache.Manager, cache *schdcache.Cache, cl client.Client, recor
 			options.customLabels,
 			options.partialPreemptionTimeout,
 			options.enableOnDemandPreemption,
+			options.enableStrictPriorityPreemption,
 		),
 		admissionRoutineWrapper:             routine.DefaultWrapper,
 		workloadOrdering:                    wo,

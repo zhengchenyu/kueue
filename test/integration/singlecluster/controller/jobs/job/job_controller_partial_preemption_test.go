@@ -27,7 +27,6 @@ import (
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/constants"
-	workloadjob "sigs.k8s.io/kueue/pkg/controller/jobs/job"
 	"sigs.k8s.io/kueue/pkg/features"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 	testingjob "sigs.k8s.io/kueue/pkg/util/testingjobs/job"
@@ -126,7 +125,7 @@ var _ = ginkgo.Describe("Job partial preemption", ginkgo.Ordered, func() {
 			WorkloadPriorityClass(lowWPC.Name).
 			SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
 			SetAnnotation(constants.PartialPreemptionAnnotation, "true").
-			SetAnnotation(workloadjob.JobMinParallelismAnnotation, minParallelism).
+			SetAnnotation(constants.PartialPreemptionMinCountAnnotation, minParallelism).
 			Parallelism(5).
 			Request(corev1.ResourceCPU, "1")
 		if maxReclaimed != "" {
@@ -166,7 +165,7 @@ var _ = ginkgo.Describe("Job partial preemption", ginkgo.Ordered, func() {
 			// Workload slicing charges min(spec.Count, admission.Count), so the admission Count is
 			// left untouched at 5 — the reduced effective usage is what frees quota.
 			g.Expect(ptr.Deref(victimWl.Status.Admission.PodSetAssignments[0].Count, -1)).Should(gomega.BeEquivalentTo(int32(5)))
-			g.Expect(victimWl.Status.Admission.PodSetAssignments[0].ReclaimTargetCount).Should(gomega.BeNil())
+			g.Expect(victimWl.Status.Admission.PodSetAssignments[0].PreemptionTargetCount).Should(gomega.BeNil())
 			// The workload controller reset the Preempted condition once the reclaim converged.
 			preempted := meta.FindStatusCondition(victimWl.Status.Conditions, kueue.WorkloadPreempted)
 			if preempted != nil {

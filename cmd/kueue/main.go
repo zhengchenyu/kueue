@@ -709,6 +709,7 @@ func setupScheduler(
 		scheduler.WithAdmissionFairSharing(cfg.AdmissionFairSharing),
 		scheduler.WithPartialPreemptionTimeout(partialPreemptionTimeout(cfg)),
 		scheduler.WithOnDemandPreemption(enableOnDemandPreemption(cfg)),
+		scheduler.WithStrictPriorityPreemption(enableStrictPriorityPreemption(cfg)),
 		scheduler.WithQuotaCheckStrategy(quotaCheckStrategy(cfg)),
 		scheduler.WithRoleTracker(roleTracker),
 		scheduler.WithPreemptionExpectations(preemptionExpectations),
@@ -771,6 +772,10 @@ func partialPreemptionTimeout(cfg *configapi.Configuration) time.Duration {
 
 func enableOnDemandPreemption(cfg *configapi.Configuration) bool {
 	return cfg.PartialPreemption != nil && cfg.PartialPreemption.EnableOnDemandPreemption
+}
+
+func enableStrictPriorityPreemption(cfg *configapi.Configuration) bool {
+	return cfg.PartialPreemption != nil && cfg.PartialPreemption.EnableStrictPriorityPreemption
 }
 
 func podsReadyRequeuingTimestamp(cfg *configapi.Configuration) configapi.RequeuingTimestamp {

@@ -35,14 +35,24 @@ import (
 
 // CandidatesOrdering criteria:
 // 0. Workloads already marked for preemption first.
-// 1. Workloads whose current count is still above their reclaim target first.
-// 2. Workloads from other ClusterQueues in the cohort before the ones in the
+// 1. Workloads from other ClusterQueues in the cohort before the ones in the
 // same ClusterQueue as the preemptor.
-// 3. (AdmissionFairSharing only) Workloads with higher LocalQueue's usage first
-// 4. Workloads with lower priority first.
-// 5. Partial-preemptible workloads first (elastic jobs that can shed replicas
+// 2. (AdmissionFairSharing only) Workloads with higher LocalQueue's usage first
+// 3. Workloads with lower priority first.
+// 4. Partial-preemptible workloads first (elastic jobs that can shed replicas
 // towards minCount without failing the whole job - a lower-cost preemption).
+// 5. Among equal partial-preemptible candidates, those with more sheddable
+// replicas above their preemption floor first ("more remaining first"). Reading
+// the cached PartialPreemptionUsedCount makes re-sorting across cycles rotate the
+// chosen candidate, spreading partial preemption more evenly instead of repeatedly
+// hitting the same workload.
 // 6. Workloads admitted more recently first.
+//
+// Note: a pending preemption target is deliberately NOT a sort key. Such a candidate
+// must shed its below-target part at its natural priority position in the non-evicted
+// pass, so it is extracted into the leading evicted pass separately (see splitEvicted
+// / buildBuckets) rather than sorted to the front - sorting it to the front would also
+// pull its below-target part ahead of lower-priority victims in the non-evicted pass.
 func CandidatesOrdering(log logr.Logger, afsEnabled bool, a, b *workload.Info, cq kueue.ClusterQueueReference, now time.Time) int {
 	return cmputil.LazyOr(
 		func() int {
@@ -50,9 +60,6 @@ func CandidatesOrdering(log logr.Logger, afsEnabled bool, a, b *workload.Info, c
 				workloadevict.IsEvicted(b.Obj),
 				workloadevict.IsEvicted(a.Obj),
 			)
-		},
-		func() int {
-			return cmputil.CompareBool(b.HasPendingReclaimTarget, a.HasPendingReclaimTarget)
 		},
 		func() int {
 			return cmputil.CompareBool(
@@ -79,6 +86,12 @@ func CandidatesOrdering(log logr.Logger, afsEnabled bool, a, b *workload.Info, c
 		},
 		func() int {
 			return cmputil.CompareBool(b.IsPartialPreemptionJob, a.IsPartialPreemptionJob)
+		},
+		func() int {
+			if a.IsPartialPreemptionJob && b.IsPartialPreemptionJob {
+				return cmp.Compare(b.PartialPreemptionUsedCount, a.PartialPreemptionUsedCount)
+			}
+			return 0
 		},
 		func() int {
 			return quotaReservationTime(b.Obj, now).Compare(quotaReservationTime(a.Obj, now))

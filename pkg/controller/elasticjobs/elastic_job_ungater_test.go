@@ -18,6 +18,7 @@ package elasticjobs
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -26,11 +27,14 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	autoscaling "k8s.io/autoscaler/cluster-autoscaler/apis/provisioningrequest/autoscaling.x-k8s.io/v1"
 	"k8s.io/component-base/metrics/testutil"
 	testingclock "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -47,6 +51,7 @@ import (
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
+	"sigs.k8s.io/kueue/pkg/workload"
 	"sigs.k8s.io/kueue/pkg/workloadslicing"
 )
 
@@ -1615,6 +1620,117 @@ func TestRecordPodSchedulingGateRemovalSeconds(t *testing.T) {
 			}
 			if diff := gocmp.Diff(tc.wantMetricsSeconds, seconds, cmpopts.EquateErrors()); diff != "" {
 				t.Errorf("Invalid PodSchedulingGateRemovalSeconds seconds (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestPartialPreemptionShrinkAndRelease exercises the reactive scale-down path: the
+// ungater evicts the ungated Pods a reclaim target has shrunk a PodSet below, and
+// once no over-target Pod remains it flips the PartiallyPreempted condition to
+// False/QuotaReleased. The fake client's eviction subresource deletes the Pod
+// outright, so a Pod set still above target on entry only releases on the next pass.
+func TestPartialPreemptionShrinkAndRelease(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.ElasticJobsViaWorkloadSlices, true)
+	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
+	now := time.Now().Truncate(time.Second)
+
+	const specCount int32 = 5
+
+	makeWorkload := func(target int32) *kueue.Workload {
+		wl := utiltestingapi.MakeWorkload("wl", "ns").
+			Finalizers(kueue.ResourceInUseFinalizerName).
+			Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+			Annotation(constants.PartialPreemptionAnnotation, "true").
+			ControllerReference(rayClusterGVK, "ray", "ray-uid").
+			PodSets(*utiltestingapi.MakePodSet(workersPodSet, int(specCount)).Request(corev1.ResourceCPU, "1").Obj()).
+			ReserveQuotaAt(
+				utiltestingapi.MakeAdmission("cq").
+					PodSets(utiltestingapi.MakePodSetAssignment(workersPodSet).
+						Assignment(corev1.ResourceCPU, "flavor", "5").
+						Count(specCount).
+						Obj()).
+					Obj(), now,
+			).
+			AdmittedAt(true, now).
+			Obj()
+		wl.Status.Admission.PodSetAssignments[0].PreemptionTargetCount = ptr.To(target)
+		workload.SetPartiallyPreemptedCondition(wl, now, true, kueue.InClusterQueueReason, "requested scale-down")
+		return wl
+	}
+
+	makeUngatedPods := func(count int) []corev1.Pod {
+		pods := make([]corev1.Pod, 0, count)
+		for i := 0; i < count; i++ {
+			pods = append(pods, *makeElasticPodForPodSet(fmt.Sprintf("worker-%d", i), workersPodSet).Obj())
+		}
+		return pods
+	}
+
+	cases := map[string]struct {
+		target            int32
+		ungatedPods       int
+		wantRemainingPods int
+		wantReleased      bool
+	}{
+		"evicts excess and keeps condition while draining": {
+			target: 2, ungatedPods: 5, wantRemainingPods: 2, wantReleased: false,
+		},
+		"releases quota once drained to target": {
+			target: 2, ungatedPods: 2, wantRemainingPods: 2, wantReleased: true,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx, _ := utiltesting.ContextWithLog(t)
+			wl := makeWorkload(tc.target)
+			pods := makeUngatedPods(tc.ungatedPods)
+
+			clientBuilder := utiltesting.NewClientBuilder().
+				WithIndex(&corev1.Pod{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexPodWorkloadSliceName).
+				WithIndex(&kueue.Workload{}, coreindexer.OwnerReferenceIndexKey(rayClusterGVK), coreindexer.WorkloadOwnerIndexFunc(rayClusterGVK)).
+				WithIndex(&kueue.Workload{}, coreindexer.WorkloadSliceNameKey, coreindexer.IndexWorkloadSliceName).
+				WithStatusSubresource(wl).
+				WithObjects(wl)
+			for i := range pods {
+				clientBuilder = clientBuilder.WithObjects(&pods[i])
+			}
+			kClient := clientBuilder.Build()
+
+			ungater := &elasticJobUngater{
+				client:            kClient,
+				clock:             testingclock.NewFakeClock(now),
+				expectationsStore: expectations.NewStore(ControllerName),
+			}
+
+			key := types.NamespacedName{Namespace: wl.Namespace, Name: wl.Name}
+			if _, err := ungater.Reconcile(ctx, reconcile.Request{NamespacedName: key}); err != nil {
+				t.Fatalf("Reconcile returned error: %v", err)
+			}
+
+			var gotPods corev1.PodList
+			if err := kClient.List(ctx, &gotPods); err != nil {
+				t.Fatalf("listing pods: %v", err)
+			}
+			if len(gotPods.Items) != tc.wantRemainingPods {
+				t.Errorf("remaining pods = %d, want %d", len(gotPods.Items), tc.wantRemainingPods)
+			}
+
+			var gotWl kueue.Workload
+			if err := kClient.Get(ctx, key, &gotWl); err != nil {
+				t.Fatalf("getting workload: %v", err)
+			}
+			cond := apimeta.FindStatusCondition(gotWl.Status.Conditions, kueue.WorkloadPartiallyPreempted)
+			if cond == nil {
+				t.Fatalf("PartiallyPreempted condition missing")
+			}
+			if tc.wantReleased {
+				if cond.Status != metav1.ConditionFalse || cond.Reason != kueue.WorkloadPartiallyPreemptedReasonQuotaReleased {
+					t.Errorf("condition = %s/%s, want False/QuotaReleased", cond.Status, cond.Reason)
+				}
+			} else if cond.Status != metav1.ConditionTrue {
+				t.Errorf("condition = %s, want True (still draining)", cond.Status)
 			}
 		})
 	}

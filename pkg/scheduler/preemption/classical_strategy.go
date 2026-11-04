@@ -55,6 +55,7 @@ func classicalPreemptionStrategy(ctx context.Context, preemptor *Preemptor, pree
 		preemptionCtx.snapshot,
 		preemptor.clock,
 		policy.CandidatesOrdering,
+		preemptor.enableStrictPriorityPreemption,
 	)
 	var attemptPossibleOpts []preemptionAttemptOpts
 	borrowWithinCohortForbidden, _ := classical.IsBorrowingWithinCohortForbidden(preemptionCtx.preemptorCQ)

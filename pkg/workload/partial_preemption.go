@@ -31,23 +31,45 @@ func IsPartialPreemptionJob(wl *kueue.Workload) bool {
 		wl.GetAnnotations()[constants.PartialPreemptionAnnotation] == "true"
 }
 
-// HasPendingReclaimTargetCount reports whether any admitted PodSet still has an in-flight
+// HasPendingPreemptionTargetCount reports whether any admitted PodSet still has an in-flight
 // partial-preemption reclaim target above its current effective count.
-func HasPendingReclaimTargetCount(wl *kueue.Workload) bool {
+func HasPendingPreemptionTargetCount(wl *kueue.Workload) bool {
 	if !IsPartialPreemptionJob(wl) || wl.Status.Admission == nil {
 		return false
 	}
 	effectiveCounts := PodSetsCountsAfterReclaim(wl)
 	for i := range wl.Status.Admission.PodSetAssignments {
 		psa := &wl.Status.Admission.PodSetAssignments[i]
-		if psa.ReclaimTargetCount == nil {
+		if psa.PreemptionTargetCount == nil {
 			continue
 		}
-		if effectiveCounts[psa.Name] > *psa.ReclaimTargetCount {
+		if effectiveCounts[psa.Name] > *psa.PreemptionTargetCount {
 			return true
 		}
 	}
 	return false
+}
+
+// PartialPreemptionUsedCount returns how many replicas a partial-preemption job can shed above
+// its PodSets' PreemptionMinCount (capped by any pending reclaim target). The caller must have
+// already confirmed the workload is a partial-preemption job. Cached on Info (see NewInfo) so the
+// preemption comparator can use it as an allocation-free tie-breaker.
+func PartialPreemptionUsedCount(wl *kueue.Workload) int32 {
+	effective := PodSetsCountsAfterReclaim(wl)
+	var usedCount int32
+	for i := range wl.Spec.PodSets {
+		ps := &wl.Spec.PodSets[i]
+		if ps.PreemptionMinCount != nil {
+			used := effective[ps.Name]
+			if target, ok := PreemptionTargetCount(wl, ps.Name); ok && target < used {
+				used = target
+			}
+			if used > *ps.PreemptionMinCount {
+				usedCount += used - *ps.PreemptionMinCount
+			}
+		}
+	}
+	return usedCount
 }
 
 // PodSetSpecCount returns the spec replica count for the named PodSet. It scans in place so hot-path
@@ -61,15 +83,15 @@ func PodSetSpecCount(wl *kueue.Workload, name kueue.PodSetReference) (int32, boo
 	return 0, false
 }
 
-// ReclaimTargetCount returns the requested partial-preemption target count for the named PodSet.
-func ReclaimTargetCount(wl *kueue.Workload, podSetName kueue.PodSetReference) (int32, bool) {
+// PreemptionTargetCount returns the requested partial-preemption target count for the named PodSet.
+func PreemptionTargetCount(wl *kueue.Workload, podSetName kueue.PodSetReference) (int32, bool) {
 	if wl.Status.Admission == nil {
 		return 0, false
 	}
 	for i := range wl.Status.Admission.PodSetAssignments {
 		psa := &wl.Status.Admission.PodSetAssignments[i]
-		if psa.Name == podSetName && psa.ReclaimTargetCount != nil {
-			return *psa.ReclaimTargetCount, true
+		if psa.Name == podSetName && psa.PreemptionTargetCount != nil {
+			return *psa.PreemptionTargetCount, true
 		}
 	}
 	return 0, false

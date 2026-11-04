@@ -1907,7 +1907,7 @@ func TestValidateWorkloadUpdatePartialPreemptionTargetCount(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	withTargetCount := func(wl *kueue.Workload, tc int32) *kueue.Workload {
 		out := wl.DeepCopy()
-		out.Status.Admission.PodSetAssignments[0].ReclaimTargetCount = new(tc)
+		out.Status.Admission.PodSetAssignments[0].PreemptionTargetCount = new(tc)
 		return out
 	}
 	cases := map[string]struct {

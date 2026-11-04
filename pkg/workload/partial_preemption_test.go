@@ -81,7 +81,7 @@ func TestPodSetSpecCount(t *testing.T) {
 	}
 }
 
-func TestReclaimTargetCount(t *testing.T) {
+func TestPreemptionTargetCount(t *testing.T) {
 	wl := utiltesting.MakeWorkload("wl", "ns").
 		PodSets(*utiltesting.MakePodSet("main", 10).Request(corev1.ResourceCPU, "1").Obj()).
 		Obj()
@@ -93,7 +93,7 @@ func TestReclaimTargetCount(t *testing.T) {
 				Obj(),
 		).
 		Obj()
-	wl.Status.Admission.PodSetAssignments[0].ReclaimTargetCount = ptr.To[int32](7)
+	wl.Status.Admission.PodSetAssignments[0].PreemptionTargetCount = ptr.To[int32](7)
 
 	cases := map[string]struct {
 		name      kueue.PodSetReference
@@ -106,15 +106,73 @@ func TestReclaimTargetCount(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			gotCount, gotOk := ReclaimTargetCount(wl, tc.name)
+			gotCount, gotOk := PreemptionTargetCount(wl, tc.name)
 			if gotCount != tc.wantCount || gotOk != tc.wantOk {
-				t.Errorf("ReclaimTargetCount(%q) = (%d, %t), want (%d, %t)", tc.name, gotCount, gotOk, tc.wantCount, tc.wantOk)
+				t.Errorf("PreemptionTargetCount(%q) = (%d, %t), want (%d, %t)", tc.name, gotCount, gotOk, tc.wantCount, tc.wantOk)
 			}
 		})
 	}
 }
 
-func TestHasPendingReclaimTargetCount(t *testing.T) {
+// TestPartialPreemptionUsedCount exercises the pure computation that reports how many replicas a
+// partial-preemption job may shed above its PodSets' PreemptionMinCount, capped by any pending
+// reclaim target. The effective count is derived from spec.PodSets (minus reclaimable pods), so
+// every case admits the workload with Count == specCount to make the admitted and effective counts
+// agree.
+func TestPartialPreemptionUsedCount(t *testing.T) {
+	makeWorkload := func(specCount, preemptionMinCount int32, target *int32) *kueue.Workload {
+		wl := utiltesting.MakeWorkload("wl", "ns").
+			PodSets(*utiltesting.MakePodSet("executor", int(specCount)).
+				Request(corev1.ResourceCPU, "1").
+				SetPreemptionMinimumCount(preemptionMinCount).
+				Obj()).
+			Obj()
+		wl.Status.Admission = utiltesting.MakeAdmission("cq").
+			PodSets(utiltesting.MakePodSetAssignment("executor").
+				Assignment(corev1.ResourceCPU, "default", "1").
+				Count(specCount).
+				Obj()).
+			Obj()
+		if target != nil {
+			wl.Status.Admission.PodSetAssignments[0].PreemptionTargetCount = target
+		}
+		return wl
+	}
+
+	cases := map[string]struct {
+		specCount          int32
+		preemptionMinCount int32
+		target             *int32
+		want               int32
+	}{
+		"far above minCount": {
+			specCount: 5, preemptionMinCount: 1, want: 4,
+		},
+		"partially above minCount": {
+			specCount: 5, preemptionMinCount: 4, want: 1,
+		},
+		"at minCount": {
+			specCount: 2, preemptionMinCount: 2, want: 0,
+		},
+		"target caps used below minCount": {
+			specCount: 5, preemptionMinCount: 3, target: ptr.To[int32](2), want: 0,
+		},
+		"target caps used above minCount": {
+			specCount: 5, preemptionMinCount: 1, target: ptr.To[int32](3), want: 2,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			wl := makeWorkload(tc.specCount, tc.preemptionMinCount, tc.target)
+			if got := PartialPreemptionUsedCount(wl); got != tc.want {
+				t.Fatalf("PartialPreemptionUsedCount() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHasPendingPreemptionTargetCount(t *testing.T) {
 	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
 
 	// The active release path lowers spec.Count (synced from job parallelism) and/or reports
@@ -136,7 +194,7 @@ func TestHasPendingReclaimTargetCount(t *testing.T) {
 				Obj()
 		}
 		if target != nil {
-			wl.Status.Admission.PodSetAssignments[0].ReclaimTargetCount = target
+			wl.Status.Admission.PodSetAssignments[0].PreemptionTargetCount = target
 		}
 		if reclaimable > 0 {
 			wl.Status.ReclaimablePods = []kueue.ReclaimablePod{{Name: "executor", Count: reclaimable}}
@@ -163,8 +221,8 @@ func TestHasPendingReclaimTargetCount(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			features.SetFeatureGateDuringTest(t, features.ReclaimablePods, tc.reclaimablePodsGate)
-			if got := HasPendingReclaimTargetCount(makeWorkload(tc.admitted, tc.specCount, tc.reclaimable, tc.target)); got != tc.want {
-				t.Fatalf("HasPendingReclaimTargetCount() = %t, want %t", got, tc.want)
+			if got := HasPendingPreemptionTargetCount(makeWorkload(tc.admitted, tc.specCount, tc.reclaimable, tc.target)); got != tc.want {
+				t.Fatalf("HasPendingPreemptionTargetCount() = %t, want %t", got, tc.want)
 			}
 		})
 	}

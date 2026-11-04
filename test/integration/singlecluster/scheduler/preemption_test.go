@@ -83,17 +83,17 @@ func expectAdmittedCount(wl *kueue.Workload, want int32) {
 	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 }
 
-// expectReclaimTargetCount asserts the admitted workload's first PodSet
+// expectPreemptionTargetCount asserts the admitted workload's first PodSet
 // assignment carries the given partial-preemption reclaim target (nil means the
 // target has been cleared).
-func expectReclaimTargetCount(wl *kueue.Workload, want *int32) {
+func expectPreemptionTargetCount(wl *kueue.Workload, want *int32) {
 	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
 		got := &kueue.Workload{}
 		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), got)).Should(gomega.Succeed())
 		g.Expect(workload.IsAdmitted(got)).Should(gomega.BeTrue())
 		g.Expect(got.Status.Admission).ShouldNot(gomega.BeNil())
 		g.Expect(got.Status.Admission.PodSetAssignments).Should(gomega.HaveLen(1))
-		g.Expect(got.Status.Admission.PodSetAssignments[0].ReclaimTargetCount).Should(gomega.Equal(want))
+		g.Expect(got.Status.Admission.PodSetAssignments[0].PreemptionTargetCount).Should(gomega.Equal(want))
 	}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
 }
 
@@ -1832,7 +1832,7 @@ var _ = ginkgo.Describe("Preemption", func() {
 				Annotation(apiconstants.PartialPreemptionAnnotation, "true").
 				Priority(lowPriority).
 				Queue(kueue.LocalQueueName(bLQ.Name)).
-				PodSets(*utiltestingapi.MakePodSet("main", 5).SetMinimumCount(1).Request(corev1.ResourceCPU, "1").Obj()).
+				PodSets(*utiltestingapi.MakePodSet("main", 5).SetMinimumCount(1).SetPreemptionMinimumCount(1).Request(corev1.ResourceCPU, "1").Obj()).
 				Obj()
 			behavioral.MustCreate(ctx, k8sClient, victim)
 			behavioral.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, victim)
@@ -1847,7 +1847,7 @@ var _ = ginkgo.Describe("Preemption", func() {
 			behavioral.MustCreate(ctx, k8sClient, preemptor)
 
 			ginkgo.By("The fixed-reduction target scales the victim down to its minimum count rather than fully evicting it")
-			expectReclaimTargetCount(victim, ptr.To[int32](1))
+			expectPreemptionTargetCount(victim, ptr.To[int32](1))
 			gomega.Consistently(func(g gomega.Gomega) {
 				got := &kueue.Workload{}
 				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(victim), got)).Should(gomega.Succeed())
@@ -1858,7 +1858,7 @@ var _ = ginkgo.Describe("Preemption", func() {
 
 			// Lowering spec.count drops the victim's effective usage to min(spec,
 			// admission), freeing quota for the preemptor. Clearing the now-satisfied
-			// reclaimTargetCount is the workloadslicing Manager's job (driven by the
+			// preemptionTargetCount is the workloadslicing Manager's job (driven by the
 			// job controller), which this scheduler-only suite does not wire up, so we
 			// assert on quota being freed rather than on the target being cleared.
 			ginkgo.By("Scaling the victim down to the reclaim target frees quota and admits the preemptor")
@@ -1875,7 +1875,7 @@ var _ = ginkgo.Describe("Preemption", func() {
 				Annotation(apiconstants.PartialPreemptionMaxReclaimedCountAnnotation, "2").
 				Priority(lowPriority).
 				Queue(kueue.LocalQueueName(bLQ.Name)).
-				PodSets(*utiltestingapi.MakePodSet("main", 5).SetMinimumCount(1).Request(corev1.ResourceCPU, "1").Obj()).
+				PodSets(*utiltestingapi.MakePodSet("main", 5).SetMinimumCount(1).SetPreemptionMinimumCount(1).Request(corev1.ResourceCPU, "1").Obj()).
 				Obj()
 			behavioral.MustCreate(ctx, k8sClient, victim)
 			behavioral.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, victim)
@@ -1890,7 +1890,7 @@ var _ = ginkgo.Describe("Preemption", func() {
 			behavioral.MustCreate(ctx, k8sClient, preemptor)
 
 			ginkgo.By("The capped target reclaims 2 replicas (5 to 3) rather than dropping to minCount")
-			expectReclaimTargetCount(victim, ptr.To[int32](3))
+			expectPreemptionTargetCount(victim, ptr.To[int32](3))
 			gomega.Consistently(func(g gomega.Gomega) {
 				got := &kueue.Workload{}
 				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(victim), got)).Should(gomega.Succeed())
@@ -1900,7 +1900,7 @@ var _ = ginkgo.Describe("Preemption", func() {
 			behavioral.ExpectWorkloadsToBePending(ctx, k8sClient, preemptor)
 
 			// See the note in the previous spec: the scheduler-only suite does not run
-			// the workloadslicing Manager that clears a satisfied reclaimTargetCount, so
+			// the workloadslicing Manager that clears a satisfied preemptionTargetCount, so
 			// we assert on freed quota rather than on the target being cleared.
 			ginkgo.By("Scaling the victim down to the reclaim target frees quota and admits the preemptor")
 			setResizeCount(victim, 3)

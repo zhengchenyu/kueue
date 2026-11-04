@@ -83,8 +83,9 @@ type Preemptor struct {
 	customLabels           *metrics.CustomLabels
 	preemptionExpectations *expectations.Store
 
-	partialPreemptionTimeout time.Duration
-	enableOnDemandPreemption bool
+	partialPreemptionTimeout       time.Duration
+	enableOnDemandPreemption       bool
+	enableStrictPriorityPreemption bool
 }
 
 // PreemptionStrategy represents a singular set of ordered potential preemption candidates.
@@ -200,20 +201,22 @@ func New(
 	customLabels *metrics.CustomLabels,
 	partialPreemptionTimeout time.Duration,
 	enableOnDemandPreemption bool,
+	enableStrictPriorityPreemption bool,
 ) *Preemptor {
 	return &Preemptor{
-		clock:                    clock,
-		client:                   cl,
-		recorder:                 recorder,
-		workloadOrdering:         workloadOrdering,
-		enableFairSharing:        fairsharing.Enabled(fs),
-		fsStrategies:             parseStrategies(fs),
-		enabledAfs:               enabledAfs,
-		partialPreemptionTimeout: partialPreemptionTimeout,
-		enableOnDemandPreemption: enableOnDemandPreemption,
-		roleTracker:              tracker,
-		customLabels:             customLabels,
-		preemptionExpectations:   preemptionExpectations,
+		clock:                          clock,
+		client:                         cl,
+		recorder:                       recorder,
+		workloadOrdering:               workloadOrdering,
+		enableFairSharing:              fairsharing.Enabled(fs),
+		fsStrategies:                   parseStrategies(fs),
+		enabledAfs:                     enabledAfs,
+		partialPreemptionTimeout:       partialPreemptionTimeout,
+		enableOnDemandPreemption:       enableOnDemandPreemption,
+		enableStrictPriorityPreemption: enableStrictPriorityPreemption,
+		roleTracker:                    tracker,
+		customLabels:                   customLabels,
+		preemptionExpectations:         preemptionExpectations,
 	}
 }
 
@@ -361,27 +364,31 @@ func (p *Preemptor) IssuePreemptions(
 		targetKey := types.NamespacedName{Name: target.WorkloadInfo.Obj.Name, Namespace: target.WorkloadInfo.Obj.Namespace}
 		if target.PartialPreemption != nil {
 			// Partial preemption: request the elastic victim to scale its PodSet down to
-			// ReclaimTargetCount instead of evicting it. We only set the request (reclaimTargetCount);
+			// PreemptionTargetCount instead of evicting it. We only set the request (preemptionTargetCount);
 			// the quota-accounted count follows down as the shed pods actually terminate, so
 			// quota is not released here. The preemptor stays pending until the quota frees.
 			pp := target.PartialPreemption
-			if targetCount, ok := workload.ReclaimTargetCount(target.WorkloadInfo.Obj, pp.PodSet); ok && targetCount == pp.ReclaimTargetCount {
-				// Even though do not update reclaimTargetCount here, we still need to update the
+			if targetCount, ok := workload.PreemptionTargetCount(target.WorkloadInfo.Obj, pp.PodSet); ok && targetCount == pp.PreemptionTargetCount {
+				// Even though do not update preemptionTargetCount here, we still need to update the
 				// successfullyPreempted counter to avoid workload to enter inadmissibleWorks.
 				successfullyPreempted.Add(1)
 				return
 			}
 			wlCopy := target.WorkloadInfo.Obj.DeepCopy()
 			if err := patching.PatchAdmissionStatus(ctx, p.client, wlCopy, p.clock, func(wl *kueue.Workload) (bool, error) {
-				updated := setReclaimTargetCount(wl, pp.PodSet, pp.ReclaimTargetCount)
-				workload.SetPreemptedCondition(
+				updated := setPreemptionTargetCount(wl, pp.PodSet, pp.PreemptionTargetCount)
+				// Partial preemption does not evict the Workload, so it marks the in-flight
+				// target with the PartiallyPreempted condition rather than Preempted/Evicted.
+				// The quota stays charged until the ungater releases it (reason QuotaReleased).
+				workload.SetPartiallyPreemptedCondition(
 					wl,
 					p.clock.Now(),
+					true,
 					target.Reason,
 					fmt.Sprintf(
 						"Requested scale-down of PodSet %q to %d to accommodate workload %s",
 						pp.PodSet,
-						pp.ReclaimTargetCount,
+						pp.PreemptionTargetCount,
 						klog.KObj(preemptor.Obj),
 					),
 				)
@@ -393,11 +400,11 @@ func (p *Preemptor) IssuePreemptions(
 			}
 			log.V(3).Info("Partial preemption: requested scale-down",
 				"targetWorkload", klog.KObj(target.WorkloadInfo.Obj), "podSet", pp.PodSet,
-				"ReclaimTargetCount", pp.ReclaimTargetCount, "preemptingWorkload", klog.KObj(preemptor.Obj))
+				"PreemptionTargetCount", pp.PreemptionTargetCount, "preemptingWorkload", klog.KObj(preemptor.Obj))
 			p.recorder.Eventf(target.WorkloadInfo.Obj, nil, corev1.EventTypeNormal, "PartiallyPreempted",
 				"PartiallyPreempted",
 				"Requested scale-down of PodSet %q to %d to accommodate workload %s",
-				string(pp.PodSet), pp.ReclaimTargetCount, klog.KObj(preemptor.Obj))
+				string(pp.PodSet), pp.PreemptionTargetCount, klog.KObj(preemptor.Obj))
 			successfullyPreempted.Add(1)
 			return
 		}
@@ -558,7 +565,6 @@ func addOrReplaceTarget(targets []*Target, target *Target) []*Target {
 type preemptionPlan struct {
 	target  *Target
 	partial bool
-	pending bool
 }
 
 // freedQuotaUsage returns the quota that committing this plan frees from the target ClusterQueue:
@@ -583,24 +589,23 @@ func (p preemptionPlan) freedQuotaUsage() workload.Usage {
 // With the PartialPreemption gate off, partialPreemptionInfoFor returns nil and this reduces to the
 // original whole-eviction behavior.
 func planPreemption(preemptionCtx *preemptionCtx, candidate *workload.Info, reason string, allowBorrowing, usageSimulated bool) preemptionPlan {
-	if target, timedOut := pendingPartialPreemptionTarget(preemptionCtx, candidate, reason); timedOut {
-		// Timed out: the real path falls back to whole eviction.
+	if pendingPartialPreemptionTimedOut(preemptionCtx, candidate) {
+		// A candidate with an in-flight reclaim target that has exceeded the
+		// partial-preemption timeout falls back to whole eviction.
 		return preemptionPlan{target: &Target{WorkloadInfo: candidate, Reason: reason}}
-	} else if target != nil {
-		// An in-flight partial reclaim; only the reclaimed slice will be freed.
-		return preemptionPlan{target: target, partial: true, pending: true}
 	}
 	if ppInfo := partialPreemptionInfoFor(candidate); ppInfo != nil {
 		var targetCount int32
 		var reducedInfo *workload.Info
-		if preemptionCtx.enableOnDemandPreemption {
+		if preemptionCtx.enableOnDemandPreemption && ppInfo.minTargetCount != ppInfo.maxTargetCount {
 			// searchPartialReduction leaves the snapshot unchanged; YieldFromSnapshot applies
 			// the chosen reduction once when the target is yielded.
 			targetCount, reducedInfo, _ = searchPartialReduction(preemptionCtx, candidate, ppInfo, allowBorrowing, usageSimulated)
 		} else {
-			// On-demand preemption is disabled: drop straight to the per-round floor instead of
-			// searching for the smallest reduction that admits the preemptor. minTargetCount
-			// already folds in the per-workload maxReclaimedCount cap.
+			// Nothing to search: either a degenerate window (minTargetCount == maxTargetCount,
+			// e.g. an in-flight reclaim target being reaffirmed) or on-demand preemption is off,
+			// in which case we reclaim one configured batch per round down to minTargetCount.
+			// minTargetCount already folds in the per-workload maxReclaimedCount cap.
 			targetCount = ppInfo.minTargetCount
 			reducedInfo = reducedInfoForPartialPreemption(candidate, ppInfo.podSet, targetCount)
 		}
@@ -609,8 +614,8 @@ func planPreemption(preemptionCtx *preemptionCtx, candidate *workload.Info, reas
 				WorkloadInfo: candidate,
 				Reason:       reason,
 				PartialPreemption: &policy.PartialPreemptionTarget{
-					PodSet:             ppInfo.podSet,
-					ReclaimTargetCount: targetCount,
+					PodSet:                ppInfo.podSet,
+					PreemptionTargetCount: targetCount,
 				},
 				ReducedInfo: reducedInfo,
 			},
@@ -621,55 +626,44 @@ func planPreemption(preemptionCtx *preemptionCtx, candidate *workload.Info, reas
 	return preemptionPlan{target: &Target{WorkloadInfo: candidate, Reason: reason}}
 }
 
-func pendingPartialPreemptionTarget(preemptionCtx *preemptionCtx, candidate *workload.Info, reason string) (*Target, bool) {
-	if !candidate.IsPartialPreemptionJob || !candidate.HasPendingReclaimTarget || candidate.Obj.Status.Admission == nil {
-		return nil, false
+// pendingPartialPreemptionTimedOut reports whether a candidate with an in-flight
+// reclaim target has waited past the partial-preemption timeout, in which case the
+// caller falls back to whole eviction. It scans every PodSet that still carries an
+// active reclaim target and returns true as soon as one has timed out; candidates
+// that are not pending, or pending but not yet timed out, return false.
+func pendingPartialPreemptionTimedOut(preemptionCtx *preemptionCtx, candidate *workload.Info) bool {
+	if preemptionCtx.partialPreemptionTimeout <= 0 || !candidate.IsPartialPreemptionJob || !candidate.HasPendingPreemptionTarget || candidate.Obj.Status.Admission == nil {
+		return false
 	}
 	assignments := candidate.Obj.Status.Admission.PodSetAssignments
 	for i := range assignments {
 		psa := &assignments[i]
-		if psa.ReclaimTargetCount == nil {
+		if psa.PreemptionTargetCount == nil {
 			continue
 		}
-		count := *psa.ReclaimTargetCount
+		count := *psa.PreemptionTargetCount
 		if specCount, ok := workload.PodSetSpecCount(candidate.Obj, psa.Name); ok && specCount <= count {
 			continue
 		}
-		if partialPreemptionTimedOut(preemptionCtx, candidate, psa.Name, count) {
-			return nil, true
+		// This PodSet still owes a reclaim. The partial-preemption clock is the
+		// workload-level PartiallyPreempted condition set True in the request phase, so
+		// if it has elapsed this victim has timed out; otherwise keep scanning the
+		// remaining PodSets.
+		partialCond := meta.FindStatusCondition(candidate.Obj.Status.Conditions, kueue.WorkloadPartiallyPreempted)
+		if partialCond == nil || partialCond.Status != metav1.ConditionTrue ||
+			preemptionCtx.clock.Since(partialCond.LastTransitionTime.Time) < preemptionCtx.partialPreemptionTimeout {
+			continue
 		}
-		// Only one PodSet carries a reclaim target per victim today (multi-minCount is not
-		// supported yet), so reducing that single PodSet is enough.
-		return &Target{
-			WorkloadInfo: candidate,
-			Reason:       reason,
-			PartialPreemption: &policy.PartialPreemptionTarget{
-				PodSet:             psa.Name,
-				ReclaimTargetCount: count,
-			},
-			ReducedInfo: reducedInfoForPartialPreemption(candidate, psa.Name, count),
-		}, false
+		preemptionCtx.log.V(3).Info("Partial preemption timed out, falling back to full eviction",
+			"preemptor", klog.KObj(preemptionCtx.preemptor.Obj),
+			"victim", klog.KObj(candidate.Obj),
+			"podSet", psa.Name,
+			"preemptionTargetCount", count,
+			"timeout", preemptionCtx.partialPreemptionTimeout,
+			"partialPreemptionStartTime", partialCond.LastTransitionTime)
+		return true
 	}
-	return nil, false
-}
-
-func partialPreemptionTimedOut(preemptionCtx *preemptionCtx, candidate *workload.Info, podSet kueue.PodSetReference, reclaimTargetCount int32) bool {
-	if preemptionCtx.partialPreemptionTimeout <= 0 {
-		return false
-	}
-	preemptedCond := meta.FindStatusCondition(candidate.Obj.Status.Conditions, kueue.WorkloadPreempted)
-	if preemptedCond == nil || preemptedCond.Status != metav1.ConditionTrue ||
-		preemptionCtx.clock.Since(preemptedCond.LastTransitionTime.Time) < preemptionCtx.partialPreemptionTimeout {
-		return false
-	}
-	preemptionCtx.log.V(3).Info("Partial preemption timed out, falling back to full eviction",
-		"preemptor", klog.KObj(preemptionCtx.preemptor.Obj),
-		"victim", klog.KObj(candidate.Obj),
-		"podSet", podSet,
-		"reclaimTargetCount", reclaimTargetCount,
-		"timeout", preemptionCtx.partialPreemptionTimeout,
-		"partialPreemptionStartTime", preemptedCond.LastTransitionTime)
-	return true
+	return false
 }
 
 // searchPartialReduction simulates reducing candidate's reclaimable PodSet to the largest target
@@ -696,15 +690,18 @@ func searchPartialReduction(preemptionCtx *preemptionCtx, candidate *workload.In
 		return fitted
 	}
 
-	reclaimableCount := ppInfo.usedCount - ppInfo.minTargetCount
+	// Scan the inclusive [minTargetCount, maxTargetCount] range for the largest target that fits
+	// (the smallest reduction). targetCount = maxTargetCount - i decreases as i grows, so
+	// fitsAfterReduction is monotonic and sort.Search returns the first fitting (largest) target.
+	reclaimableCount := ppInfo.maxTargetCount - ppInfo.minTargetCount + 1
 	targetCount := ppInfo.minTargetCount
 	fitted := false
 	if reclaimableCount > 0 {
 		firstFittingReduction := sort.Search(int(reclaimableCount), func(i int) bool {
-			return fitsAfterReduction(ppInfo.usedCount - int32(i) - 1)
+			return fitsAfterReduction(ppInfo.maxTargetCount - int32(i))
 		})
 		if firstFittingReduction < int(reclaimableCount) {
-			targetCount = ppInfo.usedCount - int32(firstFittingReduction) - 1
+			targetCount = ppInfo.maxTargetCount - int32(firstFittingReduction)
 			fitted = true
 		}
 	}
@@ -743,64 +740,90 @@ func revertPreemption(snapshot *schdcache.Snapshot, t *Target) {
 }
 
 type partialPreemptionInfo struct {
-	podSet         kueue.PodSetReference
-	usedCount      int32
+	podSet kueue.PodSetReference
+	// maxTargetCount is the highest reclaim target (smallest reduction) the search may request this
+	// round, and minTargetCount is the lowest (largest reduction). The search scans the inclusive
+	// [minTargetCount, maxTargetCount] range.
+	maxTargetCount int32
 	minTargetCount int32
 }
 
-// partialPreemptionInfoFor returns the current effective used count and the lowest target that a
-// partial-preemption decision can request. The target incorporates maxReclaimedCount, so it is the
-// lowest target for the current partial-preemption round rather than necessarily the PodSet minCount.
-// At most one reclaimable PodSet is supported because of the workload webhook's minCount validation.
+// partialPreemptionInfoFor returns the reclaim target window [minTargetCount, maxTargetCount] for
+// this round, or nil to fall back to whole eviction. When a pending reclaim target is still
+// draining (the PodSet's used count exceeds the in-flight PreemptionTargetCount), that target is
+// reused directly as a degenerate window so the candidate stays preemptible while its pods
+// terminate; otherwise the window descends from used-1 (smallest reduction) down to the PodSet's
+// preemptionMinCount tightened by maxReclaimedCount (largest reduction). The candidate is eligible
+// only when exactly one PodSet is above its preemptionMinCount and that PodSet has no topology
+// assignment; otherwise it falls back to whole eviction.
 func partialPreemptionInfoFor(candidate *workload.Info) *partialPreemptionInfo {
 	if !candidate.IsPartialPreemptionJob {
 		return nil
 	}
 
-	mins := make(map[kueue.PodSetReference]int32, len(candidate.Obj.Spec.PodSets))
+	floors := make(map[kueue.PodSetReference]int32, len(candidate.Obj.Spec.PodSets))
 	for i := range candidate.Obj.Spec.PodSets {
 		ps := &candidate.Obj.Spec.PodSets[i]
-		if ps.MinCount != nil {
-			mins[ps.Name] = *ps.MinCount
+		if ps.PreemptionMinCount != nil {
+			floors[ps.Name] = *ps.PreemptionMinCount
 		}
 	}
-	// Webhook limitations: At most one podset can have minCount.
-	if len(mins) != 1 {
+	if len(floors) == 0 {
 		return nil
 	}
 
 	maxReclaimedCount, hasMaxReclaimedCount := partialPreemptionMaxReclaimedCount(candidate.Obj)
+	var info *partialPreemptionInfo
 	for _, psr := range candidate.TotalRequests {
-		minCount, ok := mins[psr.Name]
+		minCount, ok := floors[psr.Name]
 		if !ok {
 			continue
 		}
-		// TODO: TAS victims are not supported yet.
+		used := psr.Count
+		if used <= minCount {
+			// Already at or below its floor; this PodSet cannot shrink further.
+			continue
+		}
+		// TODO: TAS victims are not supported yet. A shrinkable PodSet with a topology
+		// assignment forces whole eviction.
 		if psr.TopologyRequest != nil {
 			return nil
 		}
-		used := psr.Count
-		if target, ok := workload.ReclaimTargetCount(candidate.Obj, psr.Name); ok && target < used {
-			used = target
-		}
-		if used <= minCount {
+		// At most one PodSet may shrink per candidate today; a second one above its floor
+		// falls back to whole eviction.
+		if info != nil {
 			return nil
 		}
-		// maxReclaimedCount caps how many replicas a single round may reclaim. Folding it into
-		// minTargetCount bounds the per-round floor for both modes: on-demand searches
-		// [minTargetCount, used) for the smallest reduction that fits, and fixed-step drops
-		// straight to minTargetCount.
+		// used > target: a pending reclaim target is still draining, so reuse it directly as a
+		// degenerate [target, target] window. The candidate stays preemptible while its pods
+		// terminate rather than being treated as already freed.
+		if target, ok := workload.PreemptionTargetCount(candidate.Obj, psr.Name); ok && used > target {
+			info = &partialPreemptionInfo{
+				podSet:         psr.Name,
+				maxTargetCount: target,
+				minTargetCount: target,
+			}
+			continue
+		}
+		// maxReclaimedCount caps how many replicas a single round may reclaim. The window spans
+		// [minTargetCount, used-1]; on-demand searches it for the smallest reduction that fits,
+		// while fixed-step drops straight to minTargetCount.
+		maxTargetCount := used - 1
 		reclaimable := used - minCount
 		if hasMaxReclaimedCount {
 			reclaimable = min(reclaimable, maxReclaimedCount)
 		}
-		return &partialPreemptionInfo{
+		minTargetCount := used - reclaimable
+		if minTargetCount > maxTargetCount {
+			minTargetCount = maxTargetCount
+		}
+		info = &partialPreemptionInfo{
 			podSet:         psr.Name,
-			usedCount:      used,
-			minTargetCount: used - reclaimable,
+			maxTargetCount: maxTargetCount,
+			minTargetCount: minTargetCount,
 		}
 	}
-	return nil
+	return info
 }
 
 func restoreSnapshot(snapshot *schdcache.Snapshot, targets []*Target) {
@@ -1042,19 +1065,19 @@ func reducedInfoForPartialPreemption(info *workload.Info, podSetName kueue.PodSe
 	return &reduced
 }
 
-// setReclaimTargetCount records count as the named PodSet's requested partial-preemption target,
+// setPreemptionTargetCount records count as the named PodSet's requested partial-preemption target,
 // reporting whether the value changed.
-func setReclaimTargetCount(wl *kueue.Workload, podSetName kueue.PodSetReference, count int32) bool {
+func setPreemptionTargetCount(wl *kueue.Workload, podSetName kueue.PodSetReference, count int32) bool {
 	if wl.Status.Admission == nil {
 		return false
 	}
 	for i := range wl.Status.Admission.PodSetAssignments {
 		psa := &wl.Status.Admission.PodSetAssignments[i]
 		if psa.Name == podSetName {
-			if ptr.Deref(psa.ReclaimTargetCount, -1) == count {
+			if ptr.Deref(psa.PreemptionTargetCount, -1) == count {
 				return false
 			}
-			psa.ReclaimTargetCount = new(count)
+			psa.PreemptionTargetCount = new(count)
 			return true
 		}
 	}
