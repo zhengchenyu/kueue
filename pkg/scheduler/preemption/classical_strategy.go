@@ -28,11 +28,6 @@ import (
 	"sigs.k8s.io/kueue/pkg/workload"
 )
 
-type candidateIterator interface {
-	Reset()
-	Next(borrow bool) (candidate *workload.Info, evictReason string)
-}
-
 // classicalPreemptionStrategy implements a heuristic to find a minimal set of Workloads
 // to preempt.
 // The heuristic first removes candidates, in the input order, while their
@@ -96,17 +91,52 @@ func classicalPreemptionStrategy(ctx context.Context, preemptor *Preemptor, pree
 					)
 				}
 			}
-			if !yieldStrategy(newPreemptionStrategy(candidateIter, allowBorrowing, preemptionCtx)) {
+			ordering := preemptor.candidatesOrdering(log, preemptionCtx.preemptorCQ.Name)
+			pl := classicalPlan(preemptionCtx, candidatesGenerator, candidateIter, allowBorrowing, ordering)
+			if !yieldStrategy(newPreemptionStrategy(candidateIter, allowBorrowing, preemptionCtx, pl)) {
 				return
 			}
 		}
 	}
 }
 
+func classicalPlan(
+	preemptionCtx *preemptionCtx,
+	candidatesGenerator classical.CandidateIterator,
+	candidateIter iter.Seq[*Target],
+	allowBorrowing bool,
+	ordering func(a, b *workload.Info) int,
+) plan {
+	if !features.Enabled(features.PartialPreemption) {
+		return &fullPlan{pCtx: preemptionCtx, iterator: candidateIter, allowBorrowing: allowBorrowing}
+	}
+	return &partialPlan{
+		pCtx:                 preemptionCtx,
+		iterator:             candidatesGenerator,
+		configurableIterator: configurableCandidates(preemptionCtx, allowBorrowing),
+		allowBorrowing:       allowBorrowing,
+		ordering:             ordering,
+	}
+}
+
+func configurableCandidates(preemptionCtx *preemptionCtx, allowBorrowing bool) iter.Seq[*Target] {
+	if !features.Enabled(features.ConfigurablePreemptions) {
+		return nil
+	}
+	return func(yield func(*Target) bool) {
+		preemptionCtx.configurableEvaluator.FindCandidates(
+			preemptionCtx.snapshot,
+			preemptionCtx.frsNeedPreemption,
+			func() bool { return workloadQuotaFits(preemptionCtx, allowBorrowing) },
+			yield,
+		)
+	}
+}
+
 func iterateOverCandidates(
 	ctx context.Context,
 	preemptionCtx *preemptionCtx,
-	iterator candidateIterator,
+	iterator classical.CandidateIterator,
 	allowBorrowing bool,
 	yield func(*Target) bool,
 ) (cont bool) {

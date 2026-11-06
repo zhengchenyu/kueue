@@ -57,6 +57,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/util/routine"
 	"sigs.k8s.io/kueue/pkg/workload"
 	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
+	"sigs.k8s.io/kueue/pkg/workload/patching"
 )
 
 const parallelPreemptions = 8
@@ -89,6 +90,11 @@ type PreemptionStrategy struct {
 	// The context is shared across all iterations of this strategy's candidates.
 	// Warning: Eeach time a candidate is yielded, it is preempted from the active context.
 	pCtx *preemptionCtx
+	// plan drives how this strategy's candidates are backfilled. A partialPlan may
+	// grow a shrunk victim back to the largest count that still fits, while a fullPlan
+	// (fair and configurable-only paths, or when PartialPreemption is off) only keeps
+	// or drops whole victims.
+	plan plan
 	// verify checks whether the final target set satisfies this strategy's invariants.
 	// If nil, any target set that fits is valid. It returns whether the target set is valid
 	// and an optional failure reason.
@@ -111,12 +117,14 @@ func newPreemptionStrategy(
 	candidates iter.Seq[*Target],
 	allowBorrowing bool,
 	pCtx *preemptionCtx,
+	plan plan,
 	opts ...strategyOption,
 ) PreemptionStrategy {
 	ps := PreemptionStrategy{
 		candidates:     candidates,
 		allowBorrowing: allowBorrowing,
 		pCtx:           pCtx,
+		plan:           plan,
 		targetsByKey:   make(map[workload.Reference]*Target),
 	}
 	for _, opt := range opts {
@@ -141,16 +149,16 @@ func (ps *PreemptionStrategy) Candidates() iter.Seq[workload.Reference] {
 
 func (ps *PreemptionStrategy) PreemptWorkload(wlKey workload.Reference) {
 	if t, ok := ps.targetsByKey[wlKey]; ok {
-		if _, inSnapshot := t.WorkloadCq.Workloads[wlKey]; inSnapshot {
-			ps.pCtx.snapshot.RemoveWorkload(t.WorkloadInfo)
+		if current := t.WorkloadCq.Workloads[wlKey]; current == t.WorkloadInfo {
+			t.Apply(ps.pCtx.snapshot)
 		}
 	}
 }
 
 func (ps *PreemptionStrategy) UnpreemptWorkload(wlKey workload.Reference) {
 	if t, ok := ps.targetsByKey[wlKey]; ok {
-		if _, inSnapshot := t.WorkloadCq.Workloads[wlKey]; !inSnapshot {
-			ps.pCtx.snapshot.AddWorkload(t.WorkloadInfo)
+		if current := t.WorkloadCq.Workloads[wlKey]; current != t.WorkloadInfo {
+			t.Revert(ps.pCtx.snapshot)
 		}
 	}
 }
@@ -255,6 +263,18 @@ type Target = policy.Target
 
 // ensures that Target implements ObjectRefProvider interface at compile time
 var _ logging.ObjectRefProvider = (*Target)(nil)
+
+func WorkloadReplacements(targets []*Target) []schdcache.WorkloadReplacement {
+	replacements := make([]schdcache.WorkloadReplacement, 0, len(targets))
+	for _, target := range targets {
+		replacement := schdcache.WorkloadReplacement{Full: target.WorkloadInfo}
+		if target.PartialPreemption != nil {
+			replacement.Reduced = target.PartialPreemption.ReducedInfo
+		}
+		replacements = append(replacements, replacement)
+	}
+	return replacements
+}
 
 func (p *Preemptor) GetPreemptionStrategyIterator(
 	ctx context.Context,
@@ -383,6 +403,18 @@ func (p *Preemptor) IssuePreemptions(
 	workqueue.ParallelizeUntil(ctx, parallelPreemptions, len(targets), func(i int) {
 		target := targets[i]
 		targetKey := types.NamespacedName{Name: target.WorkloadInfo.Obj.Name, Namespace: target.WorkloadInfo.Obj.Namespace}
+		if target.PartialPreemption != nil {
+			pp := target.PartialPreemption
+			if currentRetained, ok := workload.PreemptionRetainedCount(target.WorkloadInfo.Obj, pp.PodSet); ok && currentRetained <= pp.RetainedCount {
+				log.V(3).Info("Partial preemption ongoing", "targetWorkload", klog.KObj(target.WorkloadInfo.Obj), "preemptingWorkload", klog.KObj(preemptor.Obj))
+			} else if err := p.partiallyPreempt(ctx, preemptor, target); err != nil {
+				errCh.SendErrorWithCancel(err, cancel)
+				preemptionErrors.Add(1)
+				return
+			}
+			successfullyPreempted.Add(1)
+			return
+		}
 		if workloadevict.IsEvicted(target.WorkloadInfo.Obj) {
 			log.V(3).Info("Preemption ongoing", "targetWorkload", klog.KObj(target.WorkloadInfo.Obj), "preemptingWorkload", klog.KObj(preemptor.Obj))
 			successfullyPreempted.Add(1)
@@ -439,6 +471,27 @@ func (p *Preemptor) IssuePreemptions(
 	return int(successfullyPreempted.Load()), int(preemptionErrors.Load()), errCh.ReceiveError()
 }
 
+// partiallyPreempt requests a scale-down; quota remains charged until the excess Pods terminate.
+func (p *Preemptor) partiallyPreempt(ctx context.Context, preemptor *workload.Info, target *Target) error {
+	pp := target.PartialPreemption
+	wlCopy := target.WorkloadInfo.Obj.DeepCopy()
+	message := fmt.Sprintf("Requested scale-down of PodSet %q to %d to accommodate workload %s",
+		pp.PodSet, pp.RetainedCount, klog.KObj(preemptor.Obj))
+	if err := patching.PatchAdmissionStatus(ctx, p.client, wlCopy, p.clock, func(wl *kueue.Workload) (bool, error) {
+		setRetainedCount(wl, pp.PodSet, pp.RetainedCount)
+		workload.SetPartiallyPreemptedCondition(wl, p.clock.Now(), true, target.Reason, message)
+		return true, nil
+	}, patching.WithLooseOnApply()); err != nil {
+		return err
+	}
+	metrics.ReportPartialPreemption(preemptor.ClusterQueue, target.Reason, p.customLabels.CQGet(preemptor.ClusterQueue), p.roleTracker)
+	ctrl.LoggerFrom(ctx).V(3).Info("Partial preemption: requested scale-down",
+		"targetWorkload", klog.KObj(target.WorkloadInfo.Obj), "podSet", pp.PodSet,
+		"RetainedCount", pp.RetainedCount, "preemptingWorkload", klog.KObj(preemptor.Obj))
+	p.recorder.Eventf(target.WorkloadInfo.Obj, nil, corev1.EventTypeNormal, "PartiallyPreempted", "PartiallyPreempted", "%s", message)
+	return nil
+}
+
 func messageAndUnderlyingCause(
 	log logr.Logger,
 	target *Target,
@@ -480,10 +533,10 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
 	log := log.FromContext(ctx)
 	for strategy := range strategies {
 		var targets []*Target
-		for candidate := range strategy.candidates {
+		for candidate := range strategy.plan.walk() {
 			targets = append(targets, candidate)
 			if workloadFits(ctx, strategy.pCtx, strategy.allowBorrowing) {
-				targets = fillBackWorkloads(ctx, strategy.pCtx, targets, strategy.allowBorrowing)
+				targets = strategy.plan.fillBack(ctx, targets)
 				if strategy.verify != nil {
 					if valid, reason := strategy.verify(targets); !valid {
 						if logV := log.V(5); logV.Enabled() {
@@ -495,12 +548,12 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
 						break
 					}
 				}
-				restoreSnapshot(strategy.pCtx.snapshot, targets)
 				if logV := log.V(5); logV.Enabled() {
 					logV.Info("Preemption target search succeeded",
 						"preemptingWorkload", klog.KObj(strategy.pCtx.preemptor.Obj),
 						"targets", logging.GetObjectReferences(targets))
 				}
+				restoreSnapshot(strategy.pCtx.snapshot, targets)
 				return targets
 			}
 		}
@@ -512,23 +565,8 @@ func (p *Preemptor) getTargets(ctx context.Context, strategies iter.Seq[Preempti
 
 func restoreSnapshot(snapshot *schdcache.Snapshot, targets []*Target) {
 	for _, t := range targets {
-		snapshot.AddWorkload(t.WorkloadInfo)
+		t.Revert(snapshot)
 	}
-}
-
-// fillBackWorkloads checks in the reverse order if any of the workloads can be added back.
-func fillBackWorkloads(ctx context.Context, preemptionCtx *preemptionCtx, targets []*Target, allowBorrowing bool) []*Target {
-	for i := len(targets) - 2; i >= 0; i-- {
-		preemptionCtx.snapshot.AddWorkload(targets[i].WorkloadInfo)
-		if workloadFits(ctx, preemptionCtx, allowBorrowing) {
-			// O(1) deletion: copy the last element into index i and reduce size.
-			targets[i] = targets[len(targets)-1]
-			targets = targets[:len(targets)-1]
-		} else {
-			preemptionCtx.snapshot.RemoveWorkload(targets[i].WorkloadInfo)
-		}
-	}
-	return targets
 }
 
 // parseStrategies converts the configured FairSharing preemption strategies into
@@ -722,4 +760,40 @@ func buildCQPath(cqName string, cqSnap *schdcache.ClusterQueueSnapshot) string {
 	// Reverse the slice since we want parent first
 	slices.Reverse(parts)
 	return "/" + strings.Join(parts, "/")
+}
+
+// reducedInfoForPartialPreemption returns a shallow copy of info with the named PodSet's usage scaled
+// down to retainedCount. The original is left untouched so the snapshot can restore it unchanged.
+func reducedInfoForPartialPreemption(info *workload.Info, podSetName kueue.PodSetReference, retainedCount int32) *workload.Info {
+	reduced := *info
+	reduced.TotalRequests = make([]workload.PodSetResources, len(info.TotalRequests))
+	for idx := range info.TotalRequests {
+		psr := info.TotalRequests[idx]
+		if psr.Name == podSetName {
+			if retainedCount >= 0 && retainedCount < psr.Count {
+				psr = *psr.ScaledTo(retainedCount)
+			}
+		}
+		reduced.TotalRequests[idx] = psr
+	}
+	return &reduced
+}
+
+// setRetainedCount records count as the named PodSet's requested partial-preemption target,
+// reporting whether the value changed.
+func setRetainedCount(wl *kueue.Workload, podSetName kueue.PodSetReference, count int32) bool {
+	if wl.Status.Admission == nil {
+		return false
+	}
+	for i := range wl.Status.Admission.PodSetAssignments {
+		psa := &wl.Status.Admission.PodSetAssignments[i]
+		if psa.Name == podSetName {
+			if psa.PartialPreemption != nil && psa.PartialPreemption.RetainedCount != nil && *psa.PartialPreemption.RetainedCount <= count {
+				return false
+			}
+			psa.PartialPreemption = &kueue.PodSetPartialPreemptionStatus{RetainedCount: new(count)}
+			return true
+		}
+	}
+	return false
 }

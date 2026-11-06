@@ -153,6 +153,7 @@ func fairPreemptionStrategy(
 			candidatesIter,
 			allowBorrowing,
 			preemptionCtx,
+			&fullPlan{pCtx: preemptionCtx, iterator: candidatesIter, allowBorrowing: allowBorrowing},
 			withVerify(func(targets []*Target) (bool, string) {
 				return verifyFairSharingTargets(preemptionCtx, targets, fsStrategies)
 			}),
