@@ -17,20 +17,27 @@ limitations under the License.
 package elasticjobs
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	autoscaling "k8s.io/autoscaler/cluster-autoscaler/apis/provisioningrequest/autoscaling.x-k8s.io/v1"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -45,7 +52,9 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/controller/core"
+	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/metrics"
+	"sigs.k8s.io/kueue/pkg/resources"
 	utilclient "sigs.k8s.io/kueue/pkg/util/client"
 	"sigs.k8s.io/kueue/pkg/util/expectations"
 	utilmaps "sigs.k8s.io/kueue/pkg/util/maps"
@@ -57,6 +66,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/workload"
 	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
 	workloadfinish "sigs.k8s.io/kueue/pkg/workload/finish"
+	"sigs.k8s.io/kueue/pkg/workload/patching"
 	"sigs.k8s.io/kueue/pkg/workloadslicing"
 )
 
@@ -129,6 +139,15 @@ func (r *elasticJobUngater) Reconcile(ctx context.Context, req reconcile.Request
 	}
 	if !shouldUngate(active) || workloadevict.IsEvicted(active) {
 		return reconcile.Result{}, nil
+	}
+
+	// Shrink any PodSet that a partial-preemption reclaim target has lowered below
+	// its running count, evicting the excess Pods. This is independent of ungating,
+	// so it runs before the pending-ungate-ops short-circuit below.
+	if features.Enabled(features.PartialPreemption) && workload.HasPendingPreemptionTargetCount(active) {
+		if err := r.shrinkToTargets(ctx, active); err != nil {
+			return reconcile.Result{}, err
+		}
 	}
 
 	// Expectations are keyed by the stable chain key (the origin slice name shared
@@ -309,7 +328,15 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
 	log := ctrl.LoggerFrom(ctx)
 	var gated []*corev1.Pod
 	for ps, candidates := range gatedPerPodSet {
-		room := granted[ps] - ungatedPerPodSet[ps]
+		// While a partial-preemption reclaim target is in flight, cap ungating at
+		// the target instead of the granted count. Pods the job's controller
+		// recreates above the target stay gated, so the PodSet effectively shrinks
+		// to the target until its quota is released.
+		ungateCap := granted[ps]
+		if target, ok := workload.PreemptionTargetCount(wl, ps); ok && target < ungateCap {
+			ungateCap = target
+		}
+		room := ungateCap - ungatedPerPodSet[ps]
 		var toUngate []*corev1.Pod
 		if room > 0 {
 			toUngate = sortCandidates(log, candidates, wl, ps)
@@ -320,6 +347,7 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
 		log.V(4).Info("elastic ungating quota accounting for PodSet",
 			"podSet", ps,
 			"grantedCount", granted[ps],
+			"ungateCap", ungateCap,
 			"alreadyUngatedCount", ungatedPerPodSet[ps],
 			"gatedCount", len(candidates),
 			"ungatingCount", len(toUngate),
@@ -327,6 +355,190 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
 		gated = append(gated, toUngate...)
 	}
 	return gated, nil
+}
+
+// shrinkToTargets evicts the running Pods that a partial-preemption reclaim
+// target has shrunk a PodSet below. The job's own controller recreates the
+// evicted Pods, but podsToUngate caps ungating at the target, so each PodSet
+// settles at its target until the quota is released. Eviction goes through the
+// Eviction API so PodDisruptionBudgets are honored; a refused eviction is
+// retried on the next reconcile rather than force-deleted. The pass is
+// level-based: it recomputes the excess from the live Pod set every time, so it
+// is safe to repeat.
+func (r *elasticJobUngater) shrinkToTargets(ctx context.Context, wl *kueue.Workload) error {
+	sliceName := workloadslicing.SliceName(wl)
+	pods, err := workloadslicing.ListPodsForWorkloadSlice(ctx, r.client, wl.Namespace, sliceName)
+	if err != nil {
+		return fmt.Errorf("listing pods for workload slice: %w", err)
+	}
+
+	// Per PodSet, collect two views of the ungated, non-terminal Pods (gated Pods
+	// hold no quota, terminal Pods none either):
+	//   - evictable: those not already terminating, the Pods we may evict to reach
+	//     the target (a Pod on its way out must not be re-evicted).
+	//   - ungatedNonTerminal: the count including terminating Pods, which still hold
+	//     quota until they are gone. The quota is only reported released once this
+	//     count drops to the target (see releaseDrainedTargets).
+	evictablePerPodSet := make(map[kueue.PodSetReference][]*corev1.Pod)
+	ungatedNonTerminalPerPodSet := make(map[kueue.PodSetReference]int32)
+	for _, p := range pods {
+		if utilpod.IsTerminated(p) {
+			continue
+		}
+		if utilpod.HasGate(p, kueue.ElasticJobSchedulingGate) {
+			continue
+		}
+		ps := kueue.PodSetReference(p.Labels[constants.PodSetLabel])
+		ungatedNonTerminalPerPodSet[ps]++
+		if p.DeletionTimestamp == nil {
+			evictablePerPodSet[ps] = append(evictablePerPodSet[ps], p)
+		}
+	}
+
+	log := ctrl.LoggerFrom(ctx)
+	var toEvict []*corev1.Pod
+	for ps, evictable := range evictablePerPodSet {
+		target, ok := workload.PreemptionTargetCount(wl, ps)
+		if !ok {
+			continue
+		}
+		// Keep `target` Pods, evict the rest. Pods already terminating counted
+		// toward neither side, so the target is measured against the Pods that will
+		// remain, keeping the pass idempotent across reconciles.
+		excess := int32(len(evictable)) - target
+		if excess <= 0 {
+			continue
+		}
+		ordered := sortEvictionCandidates(evictable)[:excess]
+		log.V(3).Info("partial-preemption shrinking PodSet",
+			"podSet", ps,
+			"evictableCount", len(evictable),
+			"targetCount", target,
+			"evictingCount", len(ordered))
+		toEvict = append(toEvict, ordered...)
+	}
+	if len(toEvict) > 0 {
+		if err := parallelize.Until(ctx, len(toEvict), func(i int) error {
+			return r.evictPod(ctx, log, toEvict[i])
+		}); err != nil {
+			return err
+		}
+	}
+	return r.releaseDrainedTargets(ctx, wl, ungatedNonTerminalPerPodSet)
+}
+
+// releaseDrainedTargets releases the quota of a drained partial-preemption target.
+// Once every PodSet carrying a target has drained down to it (the drain count
+// includes terminating Pods, which still hold quota until they are actually gone),
+// Kueue lowers the PodSet's admitted count and resourceUsage to the target, clears
+// the target, and flips the PartiallyPreempted condition to False (reason
+// QuotaReleased), all in one status update. Lowering the admitted count - rather
+// than reporting reclaimablePods relative to the spec count - keeps the grant equal
+// to the real size and never releases quota before the Pods are gone.
+func (r *elasticJobUngater) releaseDrainedTargets(ctx context.Context, wl *kueue.Workload, ungatedNonTerminal map[kueue.PodSetReference]int32) error {
+	if !apimeta.IsStatusConditionTrue(wl.Status.Conditions, kueue.WorkloadPartiallyPreempted) {
+		return nil
+	}
+	for i := range wl.Status.Admission.PodSetAssignments {
+		psa := &wl.Status.Admission.PodSetAssignments[i]
+		if psa.PreemptionTargetCount == nil {
+			continue
+		}
+		if ungatedNonTerminal[psa.Name] > *psa.PreemptionTargetCount {
+			// Still draining: an over-target Pod (possibly terminating) holds quota.
+			return nil
+		}
+	}
+	log := ctrl.LoggerFrom(ctx)
+	wlCopy := wl.DeepCopy()
+	if err := patching.PatchAdmissionStatus(ctx, r.client, wlCopy, r.clock, func(wl *kueue.Workload) (bool, error) {
+		// Recompute from scratch: the closure may run again on a patch conflict.
+		updated := false
+		for i := range wl.Status.Admission.PodSetAssignments {
+			psa := &wl.Status.Admission.PodSetAssignments[i]
+			if psa.PreemptionTargetCount == nil {
+				continue
+			}
+			target := *psa.PreemptionTargetCount
+			if oldCount := ptr.Deref(psa.Count, target); oldCount > target {
+				// Scale the recorded resource usage down in proportion to the count,
+				// matching how the quota accounting scales it (totalRequestsFromAdmission).
+				req := resources.NewRequestsFromResourceList(psa.ResourceUsage)
+				req.Divide(int64(oldCount))
+				req.Mul(int64(target))
+				psa.ResourceUsage = req.ToResourceList(resources.NewResourceFormatter())
+				psa.Count = ptr.To(target)
+			}
+			psa.PreemptionTargetCount = nil
+			updated = true
+		}
+		changed := workload.SetPartiallyPreemptedCondition(
+			wl,
+			r.clock.Now(),
+			false,
+			kueue.WorkloadPartiallyPreemptedReasonQuotaReleased,
+			"Partial-preemption reclaim target satisfied; quota released",
+		)
+		return updated || changed, nil
+	}, patching.WithLooseOnApply()); err != nil {
+		return fmt.Errorf("releasing partial-preemption quota: %w", err)
+	}
+	log.V(3).Info("partial-preemption quota released", "workload", klog.KObj(wl))
+	return nil
+}
+
+// sortEvictionCandidates orders Pods least-valuable first, matching the KEP:
+// unscheduled Pods first, then the lowest pod-deletion-cost, then the newest.
+func sortEvictionCandidates(pods []*corev1.Pod) []*corev1.Pod {
+	ordered := slices.Clone(pods)
+	slices.SortFunc(ordered, func(a, b *corev1.Pod) int {
+		if aScheduled, bScheduled := utilpod.IsScheduled(a), utilpod.IsScheduled(b); aScheduled != bScheduled {
+			if !aScheduled {
+				return -1
+			}
+			return 1
+		}
+		if c := cmp.Compare(podDeletionCost(a), podDeletionCost(b)); c != 0 {
+			return c
+		}
+		return b.CreationTimestamp.Time.Compare(a.CreationTimestamp.Time)
+	})
+	return ordered
+}
+
+// podDeletionCost reads the controller.kubernetes.io/pod-deletion-cost annotation,
+// defaulting to 0 when it is absent or malformed (matching the Job controller).
+func podDeletionCost(pod *corev1.Pod) int64 {
+	if v, ok := pod.Annotations[corev1.PodDeletionCost]; ok {
+		if cost, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return cost
+		}
+	}
+	return 0
+}
+
+// evictPod requests eviction of a single Pod through the Eviction API. A refused
+// eviction (a PodDisruptionBudget would be violated) is surfaced as an error so
+// the reconcile is retried with backoff; an already-gone Pod is not an error.
+func (r *elasticJobUngater) evictPod(ctx context.Context, log logr.Logger, pod *corev1.Pod) error {
+	eviction := &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pod.Name,
+			Namespace: pod.Namespace,
+		},
+	}
+	if err := r.client.SubResource("eviction").Create(ctx, pod, eviction); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if apierrors.IsTooManyRequests(err) {
+			log.V(3).Info("partial-preemption eviction blocked by PodDisruptionBudget, will retry", "pod", klog.KObj(pod))
+			return err
+		}
+		return fmt.Errorf("evicting pod %s: %w", klog.KObj(pod), err)
+	}
+	log.V(3).Info("evicted elastic pod above partial-preemption target", "pod", klog.KObj(pod))
+	return nil
 }
 
 // sortCandidates orders by completion index, or by name if any Pod lacks a valid index.

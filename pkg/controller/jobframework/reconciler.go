@@ -1762,9 +1762,12 @@ func EquivalentToWorkload(ctx context.Context, c client.Client, job GenericJob, 
 	}
 	jobPodSets := clearUnusableMinCounts(getPodSets, wl)
 
-	opts := make([]equality.ComparePodSetsOption, 0, 3)
+	opts := make([]equality.ComparePodSetsOption, 0, 4)
 	if workload.IsAdmitted(wl) {
 		opts = append(opts, equality.WithIgnoreTolerations())
+	}
+	if workload.HasPendingPreemptionTargetCount(wl) {
+		opts = append(opts, equality.WithIgnoreCount())
 	}
 	if !features.Enabled(features.TopologyAwareScheduling) {
 		opts = append(opts, equality.WithIgnoreTopologyRequest())
@@ -2132,6 +2135,13 @@ func (r *JobReconciler) prepareWorkload(ctx context.Context, job GenericJob, wl 
 
 	if err := PrepareWorkloadPriority(ctx, r.client, r.record, job.Object(), wl, getCustomPriorityClassFuncFromJob(job)); err != nil {
 		return err
+	}
+
+	if job.Object().GetAnnotations()[constants.PartialPreemptionAnnotation] == "true" {
+		metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.PartialPreemptionAnnotation, "true")
+	}
+	if maxReclaimedCount := job.Object().GetAnnotations()[constants.PartialPreemptionMaxReclaimedCountAnnotation]; maxReclaimedCount != "" {
+		metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.PartialPreemptionMaxReclaimedCountAnnotation, maxReclaimedCount)
 	}
 
 	// Elastic jobs only get their elastic annotation in prepareWorkloadSlice, so it must run before

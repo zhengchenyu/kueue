@@ -146,7 +146,7 @@ func ValidateWorkload(obj, oldObj *kueue.Workload) field.ErrorList {
 		allErrs = append(allErrs, field.Invalid(specPath.Child("podSets"), variableCountPodSets, "at most one podSet can use minCount"))
 	}
 
-	if variableCountPodSets > 0 && !elasticPartialScaleUp && workloadslicing.Enabled(obj) {
+	if variableCountPodSets > 0 && !elasticPartialScaleUp && workloadslicing.Enabled(obj) && !workload.IsPartialPreemptionJob(obj) {
 		allErrs = append(allErrs, field.Invalid(specPath.Child("podSets"), variableCountPodSets, "partial admission and elastic job cannot be used together"))
 	}
 
@@ -412,7 +412,7 @@ func ValidateWorkloadUpdate(newObj, oldObj *kueue.Workload) field.ErrorList {
 	if workload.HasQuotaReservation(newObj) && workload.HasQuotaReservation(oldObj) {
 		allErrs = append(allErrs, validateReclaimablePodsUpdate(newObj, oldObj, field.NewPath("status", "reclaimablePods"))...)
 	}
-	allErrs = append(allErrs, validateAdmissionUpdate(newObj.Status.Admission, oldObj.Status.Admission, field.NewPath("status", "admission"))...)
+	allErrs = append(allErrs, validateAdmissionUpdate(newObj.Status.Admission, oldObj.Status.Admission, workloadslicing.Enabled(newObj), field.NewPath("status", "admission"))...)
 	allErrs = append(allErrs, validateImmutablePodSetUpdates(newObj, oldObj, statusPath.Child("admissionChecks"))...)
 	allErrs = append(allErrs, validateClusterNameUpdate(newObj, oldObj, statusPath)...)
 
@@ -425,7 +425,7 @@ func ValidateWorkloadUpdate(newObj, oldObj *kueue.Workload) field.ErrorList {
 
 // validateAdmissionUpdate validates that admission can be set or unset, but the
 // fields within can't change.
-func validateAdmissionUpdate(new, old *kueue.Admission, path *field.Path) field.ErrorList {
+func validateAdmissionUpdate(new, old *kueue.Admission, elastic bool, path *field.Path) field.ErrorList {
 	if old == nil || new == nil {
 		return nil
 	}
@@ -437,6 +437,25 @@ func validateAdmissionUpdate(new, old *kueue.Admission, path *field.Path) field.
 		for i := range new.PodSetAssignments {
 			old.PodSetAssignments[i].TopologyAssignment = new.PodSetAssignments[i].TopologyAssignment
 			old.PodSetAssignments[i].DelayedTopologyRequest = new.PodSetAssignments[i].DelayedTopologyRequest
+		}
+	}
+	if features.Enabled(features.PartialPreemption) && len(new.PodSetAssignments) == len(old.PodSetAssignments) {
+		// Kueue owns preemptionTargetCount and updates it on an already-admitted Workload to request (or
+		// clear) a partial-preemption scale-down; allow it to change.
+		for i := range new.PodSetAssignments {
+			old.PodSetAssignments[i].PreemptionTargetCount = new.PodSetAssignments[i].PreemptionTargetCount
+		}
+		// On the release of a partial preemption, Kueue lowers an elastic Workload's admitted count and
+		// resourceUsage to the target (a decrease only); allow that.
+		if elastic {
+			for i := range new.PodSetAssignments {
+				np := &new.PodSetAssignments[i]
+				op := &old.PodSetAssignments[i]
+				if ptr.Deref(np.Count, 0) <= ptr.Deref(op.Count, 0) {
+					op.Count = np.Count
+					op.ResourceUsage = np.ResourceUsage
+				}
+			}
 		}
 	}
 	return apivalidation.ValidateImmutableField(new, old, path)

@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
 	"sigs.k8s.io/kueue/pkg/features"
@@ -356,10 +357,11 @@ func cleanLabels(pt *corev1.PodTemplateSpec) *corev1.PodTemplateSpec {
 
 func (j *Job) PodSets(ctx context.Context, _ client.Client) ([]kueue.PodSet, error) {
 	podSet := kueue.PodSet{
-		Name:     kueue.DefaultPodSetName,
-		Template: *cleanLabels(j.Spec.Template.DeepCopy()),
-		Count:    j.podsCount(),
-		MinCount: j.podSetMinCount(),
+		Name:               kueue.DefaultPodSetName,
+		Template:           *cleanLabels(j.Spec.Template.DeepCopy()),
+		Count:              j.podsCount(),
+		MinCount:           j.podSetMinCount(),
+		PreemptionMinCount: j.podSetPreemptionMinCount(),
 	}
 	if features.Enabled(features.TopologyAwareScheduling) {
 		topologyRequest, err := jobframework.NewPodSetTopologyRequest(
@@ -482,6 +484,24 @@ func (j *Job) podSetMinCount() *int32 {
 		return new(j.podsCount())
 	}
 	return j.minPodsCount()
+}
+
+// podSetPreemptionMinCount returns the partial-preemption scale-down floor read from the
+// kueue.x-k8s.io/partial-preemption-min-count annotation, or nil when the feature gate is off
+// or the annotation is absent or malformed. It is independent of minCount (partial admission).
+func (j *Job) podSetPreemptionMinCount() *int32 {
+	if !features.Enabled(features.PartialPreemption) {
+		return nil
+	}
+	strVal, found := j.GetAnnotations()[constants.PartialPreemptionMinCountAnnotation]
+	if !found {
+		return nil
+	}
+	minCount, err := strconv.ParseInt(strVal, 10, 32)
+	if err != nil || minCount < 0 {
+		return nil
+	}
+	return ptr.To(int32(minCount))
 }
 
 func (j *Job) partialAdmissionRequested() bool {
