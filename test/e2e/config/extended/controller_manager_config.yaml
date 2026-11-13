@@ -47,6 +47,7 @@ featureGates:
   LocalQueueMetrics: true
   ElasticJobsViaWorkloadSlices: true
   ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true
+  PartialPreemption: true
   ConcurrentAdmission: true
   TASTopologySpreading: true
 tls:
