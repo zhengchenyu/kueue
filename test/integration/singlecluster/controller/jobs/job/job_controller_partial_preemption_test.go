@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	pkgconstants "sigs.k8s.io/kueue/pkg/constants"
@@ -38,7 +39,6 @@ import (
 	testingjob "sigs.k8s.io/kueue/pkg/util/testingjobs/job"
 	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
 	"sigs.k8s.io/kueue/pkg/workload"
-	workloadfinish "sigs.k8s.io/kueue/pkg/workload/finish"
 	"sigs.k8s.io/kueue/pkg/workloadslicing"
 	"sigs.k8s.io/kueue/test/integration/framework"
 	"sigs.k8s.io/kueue/test/util/behavioral"
@@ -89,17 +89,21 @@ func expectPodCounts(ctx context.Context, namespace, podNamePrefix string, podSe
 //	re-grow  - once the preemptor leaves, the victim scales back up to its original parallelism.
 var _ = ginkgo.Describe("Job partial preemption", ginkgo.Ordered, ginkgo.ContinueOnFailure, func() {
 	var (
-		ns *corev1.Namespace
-		rf *kueue.ResourceFlavor
-		cq *kueue.ClusterQueue
-		lq *kueue.LocalQueue
+		indexedClient client.Client
+		ns            *corev1.Namespace
+		rf            *kueue.ResourceFlavor
+		cq            *kueue.ClusterQueue
+		lq            *kueue.LocalQueue
 	)
 
 	ginkgo.BeforeAll(func() {
 		features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.ElasticJobsViaWorkloadSlices, true)
 		features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.ReclaimablePods, true)
 		features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.PartialPreemption, true)
-		fwk.StartManager(ctx, cfg, managerAndControllersSetup(false, true, nil))
+		fwk.StartManager(ctx, cfg, func(ctx context.Context, mgr manager.Manager) {
+			indexedClient = mgr.GetClient()
+			managerAndControllersSetup(false, true, nil)(ctx, mgr)
+		})
 	})
 
 	ginkgo.AfterAll(func() {
@@ -253,18 +257,13 @@ var _ = ginkgo.Describe("Job partial preemption", ginkgo.Ordered, ginkgo.Continu
 			gomega.Expect(k8sClient.Delete(ctx, preemptor)).Should(gomega.Succeed())
 
 			// The scale-up slice replaces the shrunk one: the old slice is left Finished (and lingers
-			// briefly), so select the victim's live admitted slice by skipping Finished Workloads.
+			// briefly), so select the victim's live admitted slice. FindLatestActiveWorkload skips
+			// Finished Workloads; its result still needs the IsAdmitted check for full admission.
 			gomega.Eventually(func(g gomega.Gomega) {
-				workloads := &kueue.WorkloadList{}
-				g.Expect(k8sClient.List(ctx, workloads, client.InNamespace(ns.Name))).Should(gomega.Succeed())
-				var admitted *kueue.Workload
-				for i := range workloads.Items {
-					wl := &workloads.Items[i]
-					if metav1.IsControlledBy(wl, victim) && workload.IsAdmitted(wl) && !workloadfinish.IsFinished(wl) {
-						admitted = wl
-					}
-				}
+				admitted, err := workloadslicing.FindLatestActiveWorkload(ctx, indexedClient, victim, batchv1.SchemeGroupVersion.WithKind("Job"))
+				g.Expect(err).ShouldNot(gomega.HaveOccurred())
 				g.Expect(admitted).ShouldNot(gomega.BeNil())
+				g.Expect(workload.IsAdmitted(admitted)).Should(gomega.BeTrue())
 				g.Expect(admitted.Status.Admission.PodSetAssignments).Should(gomega.HaveLen(1))
 				g.Expect(admitted.Status.Admission.PodSetAssignments[0].Count).Should(gomega.HaveValue(gomega.Equal(parallelism)))
 				g.Expect(workload.ExtractGrantedPodSetCounts(admitted)[podSet]).Should(gomega.Equal(parallelism))
@@ -316,19 +315,14 @@ var _ = ginkgo.Describe("Job partial preemption", ginkgo.Ordered, ginkgo.Continu
 
 		// liveAdmittedSlice returns the job's current (non-finished) admitted Workload slice.
 		liveAdmittedSlice := func(g gomega.Gomega, jobName string) *kueue.Workload {
-			workloads := &kueue.WorkloadList{}
-			g.Expect(k8sClient.List(ctx, workloads, client.InNamespace(ns.Name))).Should(gomega.Succeed())
-			var live *kueue.Workload
-			for i := range workloads.Items {
-				wl := &workloads.Items[i]
-				if len(wl.OwnerReferences) == 0 || wl.OwnerReferences[0].Name != jobName {
-					continue
-				}
-				if workload.IsAdmitted(wl) && !workloadfinish.IsFinished(wl) {
-					live = wl
-				}
+			wl, err := workloadslicing.FindLatestActiveWorkload(ctx, indexedClient,
+				&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: ns.Name, Name: jobName}},
+				batchv1.SchemeGroupVersion.WithKind("Job"))
+			g.Expect(err).ShouldNot(gomega.HaveOccurred())
+			if wl != nil && !workload.IsAdmitted(wl) {
+				return nil
 			}
-			return live
+			return wl
 		}
 
 		admittedSliceKey := func(jobName string) (client.ObjectKey, kueue.PodSetReference) {

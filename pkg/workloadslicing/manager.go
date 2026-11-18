@@ -29,7 +29,6 @@ import (
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/metrics"
-	clientutil "sigs.k8s.io/kueue/pkg/util/client"
 	"sigs.k8s.io/kueue/pkg/util/roletracker"
 	"sigs.k8s.io/kueue/pkg/workload"
 	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
@@ -116,10 +115,8 @@ func (r *Manager) EnsureWorkloadSlices(
 		// a. It hasn't been admitted (no quota reserved), or
 		// b. It's a scale-down event.
 		if !workload.HasQuotaReservation(wl) || ScaledDown(wlPodSetsCounts, jobPodSetsCounts) {
-			if err := clientutil.Patch(ctx, r.Client, wl, func() (bool, error) {
-				workload.ApplyPodSetCounts(wl, jobPodSetsCounts)
-				return true, nil
-			}, clientutil.WithLoose()); err != nil {
+			workload.ApplyPodSetCounts(wl, jobPodSetsCounts)
+			if err := r.Client.Update(ctx, wl); err != nil {
 				return nil, true, fmt.Errorf("failed to update workload's pod sets counts: %w", err)
 			}
 			return wl, true, nil
