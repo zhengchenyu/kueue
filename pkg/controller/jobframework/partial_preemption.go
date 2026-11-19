@@ -24,12 +24,15 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/features"
+	clientutil "sigs.k8s.io/kueue/pkg/util/client"
 	"sigs.k8s.io/kueue/pkg/util/parallelize"
 	"sigs.k8s.io/kueue/pkg/workload"
 )
@@ -72,6 +75,41 @@ func (r *JobReconciler) reclaimCandidates(ctx context.Context, job GenericJob, w
 		return nil, nil
 	}
 	return ppJob.PodsToReclaim(ctx, r.client, wl, targets)
+}
+
+// PropagatePartialPreemptionAnnotation copies the partial-preemption opt-in annotation from
+// obj to wl in memory, without persisting the change.
+func PropagatePartialPreemptionAnnotation(obj client.Object, wl *kueue.Workload) bool {
+	jobEnabled := obj.GetAnnotations()[constants.PartialPreemptionAnnotation] == "true"
+	_, wlHasAnnotation := wl.Annotations[constants.PartialPreemptionAnnotation]
+	if jobEnabled == wlHasAnnotation {
+		return false
+	}
+	if jobEnabled {
+		metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.PartialPreemptionAnnotation, "true")
+	} else {
+		delete(wl.Annotations, constants.PartialPreemptionAnnotation)
+	}
+	return true
+}
+
+// UpdatePartialPreemptionAnnotation patches each workload's partial-preemption opt-in
+// annotation to match obj, skipping the request when the value is already up to date.
+func UpdatePartialPreemptionAnnotation(ctx context.Context, c client.Client, obj client.Object, wls ...*kueue.Workload) error {
+	if !features.Enabled(features.PartialPreemption) {
+		return nil
+	}
+	for _, wl := range wls {
+		if wl == nil {
+			continue
+		}
+		if err := clientutil.Patch(ctx, c, wl, func() (bool, error) {
+			return PropagatePartialPreemptionAnnotation(obj, wl), nil
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // evictPodForReclaim evicts one Pod through the Eviction API.

@@ -316,7 +316,7 @@ var _ = ginkgo.Describe("Job partial preemption", ginkgo.Ordered, ginkgo.Continu
 		// liveAdmittedSlice returns the job's current (non-finished) admitted Workload slice.
 		liveAdmittedSlice := func(g gomega.Gomega, jobName string) *kueue.Workload {
 			wl, err := workloadslicing.FindLatestActiveWorkload(ctx, indexedClient,
-				&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: ns.Name, Name: jobName}},
+				&batchv1.Job{Namespace: ns.Name, Name: jobName},
 				batchv1.SchemeGroupVersion.WithKind("Job"))
 			g.Expect(err).ShouldNot(gomega.HaveOccurred())
 			if wl != nil && !workload.IsAdmitted(wl) {

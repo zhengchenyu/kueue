@@ -1040,16 +1040,16 @@ func (m *IntegrationManager) FindAncestorJobManagedByKueue(ctx context.Context, 
 	}
 }
 
-// syncWorkloadSlicePriority applies a priority-class label change to the slices
-// a compatible scale decision leaves live. Slice compatibility only considers
-// the pod set shape, so the label change arrives here with the old priority
+// syncWorkloadSliceState applies a priority-class label change and the partial-preemption
+// opt-in to the slices a compatible scale decision leaves live. Slice compatibility only
+// considers the pod set shape, so these job-level changes arrive here with the old values
 // still on the slice.
 //
 // While a scale-up waits for quota the admitted slice is kept alongside its
 // pending replacement and only the replacement is returned, but both are
 // ordered against other Workloads during preemption, so updating one alone
 // would split the Job's priority. wl is nil when a new slice is to be created.
-func (r *JobReconciler) syncWorkloadSlicePriority(ctx context.Context, job GenericJob, object client.Object, wl *kueue.Workload) error {
+func (r *JobReconciler) syncWorkloadSliceState(ctx context.Context, job GenericJob, object client.Object, wl *kueue.Workload) error {
 	log := ctrl.LoggerFrom(ctx)
 
 	// Quota-reserved rather than admitted: FindLatestActiveWorkload selects on
@@ -1067,7 +1067,10 @@ func (r *JobReconciler) syncWorkloadSlicePriority(ctx context.Context, job Gener
 	// The quota-reserved/no-priorityClassRef legality check lives in
 	// UpdateWorkloadPriority so the ordinary Job and LeaderWorkerSet paths, which
 	// reach the shared helper without this caller's filtering, get the same guard.
-	return UpdateWorkloadPriority(ctx, r.client, r.record, job.Object(), getCustomPriorityClassFuncFromJob(job), live...)
+	if err := UpdateWorkloadPriority(ctx, r.client, r.record, job.Object(), getCustomPriorityClassFuncFromJob(job), live...); err != nil {
+		return err
+	}
+	return UpdatePartialPreemptionAnnotation(ctx, r.client, job.Object(), live...)
 }
 
 // workloadOwnedBy reports whether the workload is already associated with the
@@ -1214,7 +1217,7 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
 			return nil, err
 		}
 		if compatible {
-			if err := r.syncWorkloadSlicePriority(ctx, job, object, wl); err != nil {
+			if err := r.syncWorkloadSliceState(ctx, job, object, wl); err != nil {
 				return nil, err
 			}
 			if wl != nil {
@@ -1304,6 +1307,10 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
 			if err := UpdateAdmissionGatedBy(ctx, r.client, r.record, job.Object(), match); err != nil {
 				return nil, err
 			}
+		}
+
+		if err := UpdatePartialPreemptionAnnotation(ctx, r.client, job.Object(), match); err != nil {
+			return nil, err
 		}
 
 		if err := UpdateWorkloadPriority(ctx, r.client, r.record, job.Object(), getCustomPriorityClassFuncFromJob(job), match); err != nil {
@@ -1802,6 +1809,7 @@ func (r *JobReconciler) updateWorkloadToMatchJob(ctx context.Context, job Generi
 		return nil, fmt.Errorf("can't construct workload for update: %w", err)
 	}
 	wl.Spec = newWl.Spec
+	PropagatePartialPreemptionAnnotation(job.Object(), wl)
 	if err = r.client.Update(ctx, wl); err != nil {
 		return nil, fmt.Errorf("updating existed workload: %w", err)
 	}
@@ -2139,9 +2147,7 @@ func (r *JobReconciler) prepareWorkload(ctx context.Context, job GenericJob, wl 
 		return err
 	}
 
-	if job.Object().GetAnnotations()[constants.PartialPreemptionAnnotation] == "true" {
-		metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.PartialPreemptionAnnotation, "true")
-	}
+	PropagatePartialPreemptionAnnotation(job.Object(), wl)
 
 	// Elastic jobs only get their elastic annotation in prepareWorkloadSlice, so it must run before
 	// clearUnusableMinCounts: MinCountsUsable recognizes elastic workloads by that annotation and

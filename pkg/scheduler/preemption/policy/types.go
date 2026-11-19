@@ -93,8 +93,9 @@ func (t *Target) Apply(snapshot *scheduler.Snapshot) {
 
 // Revert restores the victim to its state before preemption.
 func (t *Target) Revert(snapshot *scheduler.Snapshot) {
-	if t.PartialPreemption != nil {
-		snapshot.RemoveWorkload(t.PartialPreemption.ReducedInfo)
+	cq := snapshot.ClusterQueue(t.WorkloadInfo.ClusterQueue)
+	if current := cq.Workloads[workload.Key(t.WorkloadInfo.Obj)]; current != nil {
+		snapshot.RemoveWorkload(current)
 	}
 	snapshot.AddWorkload(t.WorkloadInfo)
 }

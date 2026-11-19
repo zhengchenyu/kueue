@@ -5347,11 +5347,14 @@ func TestPartialPreemptionGetTargets(t *testing.T) {
 			features.SetFeatureGateDuringTest(t, features.PartialPreemption, !tc.gateDisabled)
 			now := time.Now().Truncate(time.Second)
 			cq := partialPreemptionClusterQueue(tc.quota)
-			targets := getPartialPreemptionTargets(t, now, cq, tc.victims, tc.incoming)
+			targets, beforeSnapshot, snapshot := getPartialPreemptionTargets(t, now, cq, tc.victims, tc.incoming)
 
 			if tc.want == nil {
 				if len(targets) != 0 {
 					t.Fatalf("GetTargets() = %+v, want no targets when the preemptor cannot fit", targets)
+				}
+				if diff := cmp.Diff(beforeSnapshot, snapshot, snapCmpOpts); diff != "" {
+					t.Errorf("Snapshot was not restored after the failed strategy attempt (-want,+got):\n%s", diff)
 				}
 				return
 			}
@@ -5563,7 +5566,13 @@ func partialPreemptionVictim(name string, priorityValue, usedCount, minCount int
 	return wl
 }
 
-func getPartialPreemptionTargets(t *testing.T, now time.Time, cq *kueue.ClusterQueue, victims []*kueue.Workload, incoming *kueue.Workload) []*Target {
+func getPartialPreemptionTargets(
+	t *testing.T,
+	now time.Time,
+	cq *kueue.ClusterQueue,
+	victims []*kueue.Workload,
+	incoming *kueue.Workload,
+) (targets []*Target, beforeSnapshot, snapshot *schdcache.Snapshot) {
 	t.Helper()
 	ctx, log := utiltesting.ContextWithLog(t)
 	items := make([]kueue.Workload, len(victims))
@@ -5590,7 +5599,12 @@ func getPartialPreemptionTargets(t *testing.T, now time.Time, cq *kueue.ClusterQ
 		preemptexpectations.New(),
 		nil,
 	)
-	snapshot, err := cqCache.Snapshot(ctx)
+	beforeSnapshot, err := cqCache.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error while building snapshot: %v", err)
+	}
+	// make a working copy of the snapshot that preemption can temporarily modify
+	snapshot, err = cqCache.Snapshot(ctx)
 	if err != nil {
 		t.Fatalf("unexpected error while building snapshot: %v", err)
 	}
@@ -5599,7 +5613,8 @@ func getPartialPreemptionTargets(t *testing.T, now time.Time, cq *kueue.ClusterQ
 	strategies := preemptor.GetPreemptionStrategyIterator(ctx, *wlInfo, snapshot, singlePodSetAssignment(flavorassigner.ResourceAssignment{
 		corev1.ResourceCPU: &flavorassigner.FlavorAssignment{Name: "default", Mode: flavorassigner.Preempt},
 	}))
-	return preemptor.GetTargetsWithStrategy(ctx, strategies)
+	targets = preemptor.GetTargetsWithStrategy(ctx, strategies)
+	return targets, beforeSnapshot, snapshot
 }
 
 // partialPreemptionVictimInCQ is like partialPreemptionVictim, but admits the victim

@@ -30,6 +30,7 @@ import (
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
+	"sigs.k8s.io/kueue/pkg/scheduler/preemption/classical"
 	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
 	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
@@ -471,19 +472,21 @@ type scriptedIterator struct {
 	idx        int
 }
 
-var _ candidateIterator = (*scriptedIterator)(nil)
+var _ classical.CandidateIterator = (*scriptedIterator)(nil)
 
 func (s *scriptedIterator) Reset() { s.idx = 0 }
 
-func (s *scriptedIterator) Close() {}
+func (s *scriptedIterator) NoCandidateFromOtherQueues() bool { return false }
 
-func (s *scriptedIterator) Next(borrow bool) *Target {
+func (s *scriptedIterator) NoCandidateForHierarchicalReclaim() bool { return false }
+
+func (s *scriptedIterator) Next(borrow bool) (*workload.Info, string) {
 	if s.idx >= len(s.candidates) {
-		return nil
+		return nil, ""
 	}
 	wl := s.candidates[s.idx]
 	s.idx++
-	return &Target{WorkloadInfo: wl, Reason: s.reason}
+	return wl, s.reason
 }
 
 // wantStage is a walk outcome: a partial target retaining the given count, or a whole
@@ -649,8 +652,14 @@ func TestFullPlanWalk(t *testing.T) {
 				candidates = append(candidates, info)
 			}
 			pl := &fullPlan{
-				pCtx:     pCtx,
-				iterator: &scriptedIterator{candidates: candidates, reason: "test"},
+				pCtx: pCtx,
+				iterator: func(yield func(*Target) bool) {
+					for _, c := range candidates {
+						if !yield(&Target{WorkloadInfo: c, Reason: "test"}) {
+							return
+						}
+					}
+				},
 			}
 			var targets []*Target
 			cont := true
@@ -746,22 +755,5 @@ func TestFullPlanFillBack(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestNewPlan(t *testing.T) {
-	_, pCtx := newPlanPreemptionCtx(t, "6", nil, "1")
-	iter := &scriptedIterator{}
-
-	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
-	pl := newPlan(pCtx, iter, false, byName)
-	if _, ok := pl.(*partialPlan); !ok {
-		t.Errorf("newPlan() with PartialPreemption on = %T, want *partialPlan", pl)
-	}
-
-	features.SetFeatureGateDuringTest(t, features.PartialPreemption, false)
-	pl = newPlan(pCtx, iter, false, byName)
-	if _, ok := pl.(*fullPlan); !ok {
-		t.Errorf("newPlan() with PartialPreemption off = %T, want *fullPlan", pl)
 	}
 }

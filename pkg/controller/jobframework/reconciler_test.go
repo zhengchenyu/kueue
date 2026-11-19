@@ -1079,6 +1079,45 @@ func TestReconcileGenericJob(t *testing.T) {
 					Obj(),
 			},
 		},
+		"partial preemption annotation changed should update workload": {
+			featureGates: map[featuregate.Feature]bool{features.PartialPreemption: true},
+			req:          baseReq,
+			job: baseJob.Clone().
+				SetAnnotation(kueueconstants.PartialPreemptionAnnotation, "true").
+				Obj(),
+			podSets: basePodSets,
+			objs: []client.Object{
+				baseWl.Clone().Name("job-test-job-1").Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*baseWl.Clone().Name("job-test-job-1").ResourceVersion("2").
+					Annotation(kueueconstants.PartialPreemptionAnnotation, "true").
+					Obj(),
+			},
+		},
+		"update workload to match job propagates partial preemption annotation": {
+			featureGates: map[featuregate.Feature]bool{features.PartialPreemption: true},
+			req:          baseReq,
+			job: baseJob.Clone().
+				Parallelism(5).
+				SetAnnotation(kueueconstants.PartialPreemptionAnnotation, "true").
+				Obj(),
+			podSets: []kueue.PodSet{
+				*utiltestingapi.MakePodSet("main", 5).Obj(),
+			},
+			objs: []client.Object{
+				baseWl.Clone().Name("job-test-job-1").
+					PodSets(*utiltestingapi.MakePodSet("main", 1).Obj()).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*baseWl.Clone().Name("job-test-job-1").
+					ResourceVersion("2").
+					PodSets(*utiltestingapi.MakePodSet("main", 5).Obj()).
+					Annotation(kueueconstants.PartialPreemptionAnnotation, "true").
+					Obj(),
+			},
+		},
 	}
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {

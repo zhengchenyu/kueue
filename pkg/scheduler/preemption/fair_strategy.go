@@ -153,44 +153,11 @@ func fairPreemptionStrategy(
 			candidatesIter,
 			allowBorrowing,
 			preemptionCtx,
-			&fullPlan{pCtx: preemptionCtx, iterator: &seqIterator{seq: candidatesIter}, allowBorrowing: allowBorrowing},
+			&fullPlan{pCtx: preemptionCtx, iterator: candidatesIter, allowBorrowing: allowBorrowing},
 			withVerify(func(targets []*Target) (bool, string) {
 				return verifyFairSharingTargets(preemptionCtx, targets, fsStrategies)
 			}),
 		))
-	}
-}
-
-type seqIterator struct {
-	seq  iter.Seq[*Target]
-	next func() (*Target, bool)
-	stop func()
-}
-
-func (c *seqIterator) Reset() {
-	if c.stop != nil {
-		c.stop()
-	}
-	c.next, c.stop = iter.Pull(c.seq)
-}
-
-func (c *seqIterator) Next(_ bool) *Target {
-	if c.next == nil {
-		c.Reset()
-	}
-	t, ok := c.next()
-	if !ok {
-		return nil
-	}
-	return t
-}
-
-// Close stops the underlying pull iterator if it was ever started, releasing its
-// goroutine. Safe to call even if Next was never called or the sequence already ran to
-// completion.
-func (c *seqIterator) Close() {
-	if c.stop != nil {
-		c.stop()
 	}
 }
 

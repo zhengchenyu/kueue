@@ -24,7 +24,7 @@ import (
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
-	"sigs.k8s.io/kueue/pkg/features"
+	"sigs.k8s.io/kueue/pkg/scheduler/preemption/classical"
 	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
 	"sigs.k8s.io/kueue/pkg/workload"
 	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
@@ -37,9 +37,8 @@ import (
 type plan interface {
 	// walk plans every candidate and yields it.
 	walk() iter.Seq[*Target]
-	// fillBack restores, in reverse order, every victim the preemptor no longer
-	// needs and returns the surviving targets in the order the candidates were
-	// considered (decreasing preemption appeal).
+	// fillBack restores unneeded victims in reverse order and returns the
+	// surviving targets in candidate order.
 	fillBack(ctx context.Context, targets []*Target) []*Target
 }
 
@@ -47,20 +46,13 @@ type plan interface {
 // the PartialPreemption feature is off.
 type fullPlan struct {
 	pCtx           *preemptionCtx
-	iterator       candidateIterator
+	iterator       iter.Seq[*Target]
 	allowBorrowing bool
 }
 
 func (p *fullPlan) walk() iter.Seq[*Target] {
 	return func(yield func(*Target) bool) {
-		defer p.iterator.Close()
-		yield = policy.YieldFromSnapshot(p.pCtx.snapshot, yield)
-		p.iterator.Reset()
-		for {
-			t := p.iterator.Next(p.allowBorrowing)
-			if t == nil {
-				break
-			}
+		for t := range p.iterator {
 			// A whole eviction does not depend on the candidate's live snapshot state,
 			// so there is no need to look it up; the ClusterQueue is enough to build the
 			// target.
@@ -91,9 +83,10 @@ func (p *fullPlan) fillBack(ctx context.Context, targets []*Target) []*Target {
 // not enough, escalates to whole evictions. It is used when the PartialPreemption
 // feature is on.
 type partialPlan struct {
-	pCtx           *preemptionCtx
-	iterator       candidateIterator
-	allowBorrowing bool
+	pCtx                 *preemptionCtx
+	iterator             classical.CandidateIterator
+	configurableIterator iter.Seq[*Target]
+	allowBorrowing       bool
 	// ordering sorts victims by decreasing preemption appeal; fillBack uses it to
 	// restore the least appealing (highest priority) victims first.
 	ordering func(a, b *workload.Info) int
@@ -116,21 +109,21 @@ type partialPlan struct {
 //
 // Every phase reads the victim's live state from the snapshot, so a victim already
 // shrunk in an earlier phase is planned against its reduced instance. A shrinkable
-// victim therefore appears twice in the yielded stream: once as a pass-2 partial and
-// once as a pass-3 whole eviction; fillBack merges the two stages.
+// victim may therefore be yielded twice — as a partial and later as a whole eviction
+// — and fillBack merges the two stages.
 func (p *partialPlan) walk() iter.Seq[*Target] {
 	return func(yield func(*Target) bool) {
-		defer p.iterator.Close()
 		yield = policy.YieldFromSnapshot(p.pCtx.snapshot, yield)
 		// Pass 1: the already-evicted prefix as whole evictions, then the in-flight
 		// partial victims reused/extended.
 		inEvictedPrefix := true
 		p.iterator.Reset()
 		for {
-			t := p.iterator.Next(p.allowBorrowing)
-			if t == nil {
+			candidateWl, reason := p.iterator.Next(p.allowBorrowing)
+			if candidateWl == nil {
 				break
 			}
+			t := &Target{WorkloadInfo: candidateWl, Reason: reason}
 			cq, current := currentCandidate(p.pCtx, t.WorkloadInfo)
 			if current == nil {
 				continue
@@ -162,10 +155,11 @@ func (p *partialPlan) walk() iter.Seq[*Target] {
 		// Pass 2: partial phase.
 		p.iterator.Reset()
 		for {
-			t := p.iterator.Next(p.allowBorrowing)
-			if t == nil {
+			candidateWl, reason := p.iterator.Next(p.allowBorrowing)
+			if candidateWl == nil {
 				break
 			}
+			t := &Target{WorkloadInfo: candidateWl, Reason: reason}
 			cq, current := currentCandidate(p.pCtx, t.WorkloadInfo)
 			if current == nil {
 				continue
@@ -182,10 +176,11 @@ func (p *partialPlan) walk() iter.Seq[*Target] {
 		// Pass 3: full phase. Escalate the still-present candidates to whole evictions.
 		p.iterator.Reset()
 		for {
-			t := p.iterator.Next(p.allowBorrowing)
-			if t == nil {
+			candidateWl, reason := p.iterator.Next(p.allowBorrowing)
+			if candidateWl == nil {
 				break
 			}
+			t := &Target{WorkloadInfo: candidateWl, Reason: reason}
 			cq, current := currentCandidate(p.pCtx, t.WorkloadInfo)
 			if current == nil {
 				continue
@@ -194,31 +189,29 @@ func (p *partialPlan) walk() iter.Seq[*Target] {
 				return
 			}
 		}
+		// Pass 4: ConfigurablePreemptions candidates, always whole-evicted.
+		if p.configurableIterator != nil {
+			for t := range p.configurableIterator {
+				cq := p.pCtx.snapshot.ClusterQueue(t.WorkloadInfo.ClusterQueue)
+				if !yield(wholeTarget(t, cq)) {
+					return
+				}
+			}
+		}
 	}
 }
 
-// fillBack merges the staged targets produced by walk and then backfills them in
-// reverse (least appealing, i.e. highest priority, victim restored first).
-//
-// A shrinkable victim can appear twice in the stream: once shrunk (a partial stage)
-// and once escalated to a whole eviction. mergeStagedTargets collapses each victim to
-// a single target and re-sorts the result by preemption appeal, so backfill does not
-// rely on the order the stages happened to be yielded in.
-//
-// The merged list is walked in reverse. A whole eviction is restored and dropped if the
-// preemptor still fits, otherwise kept. A shrinkable victim is handled by
-// fillbackPartialPreemption, which tries, in order, a full restore, a floor restore,
-// and finally a search for the largest count above the floor that still fits.
+// fillBack merges the staged targets, then restores the least appealing victims
+// first, dropping each one the preemptor can fit without. Shrinkable victims are
+// regrown via fillbackPartialPreemption.
 func (p *partialPlan) fillBack(ctx context.Context, targets []*Target) []*Target {
 	merged := p.mergeStagedTargets(targets)
 	for i := len(merged) - 1; i >= 0; i-- {
 		t := merged[i]
-		// A shrinkable victim, whether staged as a partial shrink or escalated to a whole
-		// eviction, is grown back over the full {0} ∪ [min, high] range by
-		// fillbackPartialPreemption. The branch keys on whether the victim is shrinkable,
-		// not on the staged target kind, so an escalated victim still gets its partial
-		// range searched instead of a plain restore-or-keep.
-		if podSet, ok := workload.PartialPreemptionPodSet(t.WorkloadInfo.Obj, t.WorkloadInfo.TotalRequests); ok {
+		// Shrinkable victims get their partial range searched instead of a plain
+		// restore-or-keep. ConfigurablePreemptions candidates are always whole-evicted
+		// by pass 4, so they're excluded even if the workload is otherwise elastic.
+		if podSet, ok := workload.PartialPreemptionPodSet(t.WorkloadInfo.Obj, t.WorkloadInfo.TotalRequests); ok && t.Reason != kueue.ConfigurablePreemptionReason {
 			if fillbackPartialPreemption(ctx, p.pCtx, t, podSet, p.allowBorrowing) {
 				// O(1) deletion: copy the last element into index i and reduce size.
 				merged[i] = merged[len(merged)-1]
@@ -238,14 +231,9 @@ func (p *partialPlan) fillBack(ctx context.Context, targets []*Target) []*Target
 	return merged
 }
 
-// mergeStagedTargets collapses the staged targets to one target per victim and sorts
-// them by decreasing preemption appeal. A shrinkable victim that both shrank (pass 2)
-// and later escalated to a whole eviction (pass 3) appears twice; the first staged target
-// is kept. Both stages carry the same full WorkloadInfo, and fillbackPartialPreemption
-// reconstructs the victim's walk-end state from the live snapshot (see wasWholeEvicted)
-// rather than from the target, so the outcome is identical whichever stage is kept. The
-// result is sorted by p.ordering so fillBack can restore the least appealing victims first
-// regardless of the yielded stage order.
+// mergeStagedTargets collapses the staged targets to one per victim, keeping the first
+// stage seen, and sorts the result by p.ordering (decreasing preemption appeal) so
+// fillBack can restore the least appealing victims first.
 func (p *partialPlan) mergeStagedTargets(targets []*Target) []*Target {
 	byKey := make(map[workload.Reference]*Target, len(targets))
 	for _, t := range targets {
@@ -297,36 +285,28 @@ func fillbackPartialPreemption(ctx context.Context, preemptionCtx *preemptionCtx
 	key := workload.Key(t.WorkloadInfo.Obj)
 	wasWholeEvicted := cq.Workloads[key] == nil
 
-	// setTo rewrites the victim's snapshot instance to hold count and returns the
-	// reduced instance it installed, or nil for a full restore or a whole eviction.
+	// setTo rewrites the victim's snapshot instance so its shrinkable PodSet holds
+	// count, preserving the other PodSets, and returns the reduced instance it
+	// installed, or nil if count restores the victim completely.
 	setTo := func(count int32) *workload.Info {
 		if current := cq.Workloads[key]; current != nil {
 			snapshot.RemoveWorkload(current)
 		}
-		switch {
-		case count >= full:
+		if count >= full {
 			snapshot.AddWorkload(t.WorkloadInfo)
 			return nil
-		case count > 0:
-			reduced := reducedInfoForPartialPreemption(t.WorkloadInfo, podSet, count)
-			snapshot.AddWorkload(reduced)
-			return reduced
 		}
-		return nil
+		reduced := reducedInfoForPartialPreemption(t.WorkloadInfo, podSet, count)
+		snapshot.AddWorkload(reduced)
+		return reduced
 	}
 	// restorePartial sets the snapshot and records the partial target at count,
 	// reusing the reduced instance setTo installed.
 	restorePartial := func(count int32) {
-		reduced := setTo(count)
-		if reduced == nil {
-			// count == 0: record a zero-usage instance so Revert/Apply still see a
-			// well-formed partial target.
-			reduced = reducedInfoForPartialPreemption(t.WorkloadInfo, podSet, count)
-		}
 		t.PartialPreemption = &policy.PartialPreemptionTarget{
 			PodSet:        podSet,
 			RetainedCount: count,
-			ReducedInfo:   reduced,
+			ReducedInfo:   setTo(count),
 		}
 	}
 
@@ -343,13 +323,13 @@ func fillbackPartialPreemption(ctx context.Context, preemptionCtx *preemptionCtx
 	if !workloadFits(ctx, preemptionCtx, allowBorrowing) {
 		if wasWholeEvicted {
 			// walk already proved the preemptor fits with the victim fully gone.
-			setTo(0)
+			if current := cq.Workloads[key]; current != nil {
+				snapshot.RemoveWorkload(current)
+			}
 			t.PartialPreemption = nil
 		}
-		// Otherwise the victim was only ever shrunk to minRetainedCount (never
-		// escalated to a whole eviction), and t.PartialPreemption already holds that
-		// shrink from pass 1/2's planPreemption — the snapshot (just set above) and
-		// the target already agree, nothing left to update.
+		// Otherwise the victim was only ever shrunk to minRetainedCount, which is
+		// already reflected in t.PartialPreemption and the snapshot set above.
 		return false
 	}
 
@@ -380,16 +360,6 @@ func podSetRequestCount(info *workload.Info, podSet kueue.PodSetReference) int32
 	return 0
 }
 
-// newPlan selects the plan for a preemption attempt: partial when the feature is
-// enabled, whole eviction otherwise. ordering sorts victims by decreasing preemption
-// appeal and is used by partialPlan.fillBack to merge the staged targets.
-func newPlan(pCtx *preemptionCtx, iterator candidateIterator, allowBorrowing bool, ordering func(a, b *workload.Info) int) plan {
-	if features.Enabled(features.PartialPreemption) {
-		return &partialPlan{pCtx: pCtx, iterator: iterator, allowBorrowing: allowBorrowing, ordering: ordering}
-	}
-	return &fullPlan{pCtx: pCtx, iterator: iterator, allowBorrowing: allowBorrowing}
-}
-
 // currentCandidate returns the candidate's ClusterQueue snapshot and its live
 // instance in that snapshot.
 func currentCandidate(pCtx *preemptionCtx, candidateWl *workload.Info) (*schdcache.ClusterQueueSnapshot, *workload.Info) {
@@ -400,16 +370,16 @@ func currentCandidate(pCtx *preemptionCtx, candidateWl *workload.Info) (*schdcac
 	return cq, cq.Workloads[workload.Key(candidateWl.Obj)]
 }
 
-func wholeTarget(seed *Target, cq *schdcache.ClusterQueueSnapshot) *Target {
-	seed.WorkloadCq = cq
-	return seed
+func wholeTarget(target *Target, cq *schdcache.ClusterQueueSnapshot) *Target {
+	target.WorkloadCq = cq
+	return target
 }
 
-// planPreemption plans a shrink of seed's candidate's shrinkable PodSet to its floor, or
+// planPreemption plans a shrink of target's candidate's shrinkable PodSet to its floor, or
 // returns nil when no shrink applies: the candidate is not partial-eligible, or its live
 // used count is already at or below the floor. It leaves the snapshot unchanged.
-func planPreemption(seed *Target, current *workload.Info) *Target {
-	candidate := seed.WorkloadInfo
+func planPreemption(target *Target, current *workload.Info) *Target {
+	candidate := target.WorkloadInfo
 	podSet, ok := workload.PartialPreemptionPodSet(candidate.Obj, candidate.TotalRequests)
 	if !ok {
 		return nil
@@ -421,9 +391,9 @@ func planPreemption(seed *Target, current *workload.Info) *Target {
 		return nil
 	}
 
-	seed.PartialPreemption = &policy.PartialPreemptionTarget{
+	target.PartialPreemption = &policy.PartialPreemptionTarget{
 		PodSet: podSet, RetainedCount: minRetainedCount,
 		ReducedInfo: reducedInfoForPartialPreemption(candidate, podSet, minRetainedCount),
 	}
-	return seed
+	return target
 }
