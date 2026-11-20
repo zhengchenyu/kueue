@@ -924,14 +924,6 @@ const (
 	// to prevent preemption loops caused by temporary share deflation.
 	FairSharingVerifyFinalTargets featuregate.Feature = "FairSharingVerifyFinalTargets"
 
-	// owner: @zhengchenyu
-	// issue: https://github.com/kubernetes-sigs/kueue/issues/975
-	//
-	// PartialPreemption enables preempting only a subset of an elastic workload's PodSet
-	// (scaling it down towards its minCount) instead of evicting the whole workload, when the
-	// workload tolerates downscaling.
-	PartialPreemption featuregate.Feature = "PartialPreemption"
-
 	// owner: @tenzen-y
 	// issue: https://github.com/kubernetes-sigs/kueue/issues/18154
 	//
@@ -966,6 +958,14 @@ const (
 	// worker ClusterQueues of a manager ClusterQueue and reports them in
 	// CapacityProvider.status for Dynamic Quota Orchestration.
 	DQOMultiKueueCapacityProvider featuregate.Feature = "DQOMultiKueueCapacityProvider"
+
+	// owner: @zhengchenyu
+	// issue: https://github.com/kubernetes-sigs/kueue/issues/975
+	//
+	// PartialPreemption enables preempting only a subset of an elastic workload's PodSet
+	// (scaling it down towards its minCount) instead of evicting the whole workload, when the
+	// workload tolerates downscaling.
+	PartialPreemption featuregate.Feature = "PartialPreemption"
 )
 
 func init() {
@@ -1224,9 +1224,6 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
 	},
 	CustomMetricLabels: {
 		{Version: version.MustParse("0.17"), Default: false, PreRelease: featuregate.Alpha},
-	},
-	PartialPreemption: {
-		{Version: version.MustParse("0.21"), Default: false, PreRelease: featuregate.Alpha},
 	},
 	SparkApplicationIntegration: {
 		{Version: version.MustParse("0.17"), Default: false, PreRelease: featuregate.Alpha},
@@ -1504,6 +1501,10 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
 	},
 
 	DQOMultiKueueCapacityProvider: {
+		{Version: version.MustParse("0.21"), Default: false, PreRelease: featuregate.Alpha},
+	},
+
+	PartialPreemption: {
 		{Version: version.MustParse("0.21"), Default: false, PreRelease: featuregate.Alpha},
 	},
 }

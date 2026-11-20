@@ -632,7 +632,7 @@ func (p *PodSetWrapper) SetMinimumCount(mc int32) *PodSetWrapper {
 	return p
 }
 
-func (p *PodSetWrapper) SetPreemptionMinimumCount(mc int32) *PodSetWrapper {
+func (p *PodSetWrapper) SetPartialPreemptionMinRetainedCount(mc int32) *PodSetWrapper {
 	p.PartialPreemption = &kueue.PodSetPartialPreemption{MinRetainedCount: &mc}
 	return p
 }

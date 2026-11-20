@@ -75,11 +75,29 @@ func (d *ConfigurablePreemptionReasonData) EvictionMessage(preemptor *kueue.Work
 
 type yieldCandidate = func(*Target) bool
 
-// YieldFromSnapshot wraps a candidate (Target) yielder with
-// logic removing the candidate from the provided snapshot.
+// Apply simulates preempting the target in the snapshot.
+func (t *Target) Apply(snapshot *scheduler.Snapshot) {
+	cq := snapshot.ClusterQueue(t.WorkloadInfo.ClusterQueue)
+	if current := cq.Workloads[workload.Key(t.WorkloadInfo.Obj)]; current != nil {
+		snapshot.RemoveWorkload(current)
+	}
+	if t.PartialPreemption != nil {
+		snapshot.AddWorkload(t.PartialPreemption.ReducedInfo)
+	}
+}
+
+// Revert restores the victim to its state before preemption.
+func (t *Target) Revert(snapshot *scheduler.Snapshot) {
+	cq := snapshot.ClusterQueue(t.WorkloadInfo.ClusterQueue)
+	if current := cq.Workloads[workload.Key(t.WorkloadInfo.Obj)]; current != nil {
+		snapshot.RemoveWorkload(current)
+	}
+	snapshot.AddWorkload(t.WorkloadInfo)
+}
+
 func YieldFromSnapshot(snapshot *scheduler.Snapshot, yield yieldCandidate) yieldCandidate {
 	return func(t *Target) bool {
-		snapshot.RemoveWorkload(t.WorkloadInfo)
+		t.Apply(snapshot)
 		return yield(t)
 	}
 }

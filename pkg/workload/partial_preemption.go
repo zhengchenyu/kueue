@@ -20,11 +20,13 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/features"
+	"sigs.k8s.io/kueue/pkg/util/api"
 	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
 )
 
@@ -106,6 +108,25 @@ func PreemptionMinRetainedCount(wl *kueue.Workload, podSetName kueue.PodSetRefer
 		}
 	}
 	return 0, false
+}
+
+// SetPartiallyPreemptedCondition sets the PartiallyPreempted condition, reporting whether it
+// changed. True marks an in-flight partial-preemption target whose quota is still charged;
+// False marks the quota release (reason QuotaReleased) or the timeout (reason Timeout).
+func SetPartiallyPreemptedCondition(w *kueue.Workload, now time.Time, active bool, reason, message string) bool {
+	status := metav1.ConditionFalse
+	if active {
+		status = metav1.ConditionTrue
+	}
+	condition := metav1.Condition{
+		Type:               kueue.WorkloadPartiallyPreempted,
+		Status:             status,
+		LastTransitionTime: metav1.NewTime(now),
+		Reason:             reason,
+		Message:            api.TruncateConditionMessage(message),
+		ObservedGeneration: w.Generation,
+	}
+	return meta.SetStatusCondition(&w.Status.Conditions, condition)
 }
 
 // ReleaseSatisfiedPreemptionTargets updates the partial-preemption condition after

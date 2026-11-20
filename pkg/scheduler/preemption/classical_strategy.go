@@ -25,7 +25,13 @@ import (
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/scheduler/preemption/classical"
 	"sigs.k8s.io/kueue/pkg/scheduler/preemption/policy"
+	"sigs.k8s.io/kueue/pkg/workload"
 )
+
+type candidateIterator interface {
+	Reset()
+	Next(borrow bool) (candidate *workload.Info, evictReason string)
+}
 
 // classicalPreemptionStrategy implements a heuristic to find a minimal set of Workloads
 // to preempt.
@@ -100,11 +106,14 @@ func classicalPreemptionStrategy(ctx context.Context, preemptor *Preemptor, pree
 func iterateOverCandidates(
 	ctx context.Context,
 	preemptionCtx *preemptionCtx,
-	iterator classical.CandidateIterator,
+	iterator candidateIterator,
 	allowBorrowing bool,
 	yield func(*Target) bool,
 ) (cont bool) {
 	yield = policy.YieldFromSnapshot(preemptionCtx.snapshot, yield)
+	if features.Enabled(features.PartialPreemption) {
+		return iterateWithPartialPreemption(preemptionCtx, iterator, allowBorrowing, yield)
+	}
 	iterator.Reset()
 	for candidateWl, reason := iterator.Next(allowBorrowing); candidateWl != nil; candidateWl, reason = iterator.Next(allowBorrowing) {
 		candidate := &Target{
