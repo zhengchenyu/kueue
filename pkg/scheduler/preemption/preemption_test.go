@@ -5688,10 +5688,9 @@ func getPartialPreemptionTargetsForCohort(
 
 // TestPartialPreemptionFillBackCohort1Regression covers cohort "coh1": P nominal
 // 8, A nominal 2, B nominal 0 (10 total). A is used at 4 (floor 2), B at 4
-// (floor 3). The 8 used leave 2 free; whole-evicting B and shrinking A to its
-// floor frees 4+2=6 more (8 free in total), more than P's request of 7 needs;
-// fillBack must grow A back from its floor (2) to 3, the largest count that
-// still fits.
+// (floor 3). The 8 used leave 2 free, so a request of 7 needs 5 more. Shrinking
+// both victims to their floors frees only 2+1=3, so the first candidate is
+// evicted on top of that, and the other one stays at its floor.
 func TestPartialPreemptionFillBackCohort1Regression(t *testing.T) {
 	features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
 
@@ -5719,15 +5718,15 @@ func TestPartialPreemptionFillBackCohort1Regression(t *testing.T) {
 	for _, target := range targets {
 		byName[target.WorkloadInfo.Obj.Name] = target
 	}
-	if b1 := byName["b1"]; b1 == nil || b1.PartialPreemption != nil {
-		t.Errorf("b1: want a whole-eviction target, got %+v", b1)
+	if a1 := byName["a1"]; a1 == nil || a1.PartialPreemption != nil {
+		t.Errorf("a1: want a whole-eviction target, got %+v", a1)
 	}
-	a1 := byName["a1"]
-	if a1 == nil || a1.PartialPreemption == nil {
-		t.Fatalf("a1: want a partial target, got %+v", a1)
+	b1 := byName["b1"]
+	if b1 == nil || b1.PartialPreemption == nil {
+		t.Fatalf("b1: want a partial target, got %+v", b1)
 	}
-	if got := a1.PartialPreemption.RetainedCount; got != 3 {
-		t.Errorf("a1: RetainedCount = %d, want 3 (fillBack should grow past the floor of 2)", got)
+	if got := b1.PartialPreemption.RetainedCount; got != 3 {
+		t.Errorf("b1: RetainedCount = %d, want 3", got)
 	}
 }
 
@@ -5765,11 +5764,11 @@ func TestPartialPreemptionFillBackCohort2Regression(t *testing.T) {
 		}
 	})
 
-	t.Run("gate on finds no targets, because shrinking to nominal prunes the only candidate", func(t *testing.T) {
+	t.Run("gate on evicts a2, because shrinking it to its floor is not enough", func(t *testing.T) {
 		features.SetFeatureGateDuringTest(t, features.PartialPreemption, true)
 		targets := getPartialPreemptionTargetsForCohort(t, now, cqs(), victims(), incoming(), "P2")
-		if len(targets) != 0 {
-			t.Errorf("want no targets (the shrink to nominal prunes a2 from further escalation), got %+v", targets)
+		if len(targets) != 1 || targets[0].WorkloadInfo.Obj.Name != "a2" || targets[0].PartialPreemption != nil {
+			t.Errorf("want a single whole eviction of a2, got %+v", targets)
 		}
 	})
 }
